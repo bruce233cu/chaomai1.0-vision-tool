@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>超迈视觉工具1.0</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <main class="app-frame">
+    <header class="app-topbar">
+      <div class="brand">
+        <div class="brand-mark">AI</div>
+        <div>
+          <h1>超迈视觉工具1.0</h1>
+          <p>AI 分析竞品优势并生成电商主图</p>
+        </div>
+      </div>
+
+      <nav class="mode-tabs" aria-label="功能导航">
+        <button class="tab active" type="button" data-mode="edit">提示词做图</button>
+        <button class="tab" type="button" data-mode="main" hidden>以图做图</button>
+        <button class="tab" type="button" data-mode="develop" hidden>产品开发</button>
+        <button class="tab" type="button" data-mode="clone" hidden>克隆详情</button>
+      </nav>
+
+      <div class="top-actions">
+        <span class="api-dot"></span>
+        <span id="userLabel" class="user-label"></span>
+        <a id="adminLink" class="top-link" href="/admin" hidden>后台</a>
+        <button id="logoutBtn" class="top-link" type="button">退出</button>
+        <div class="status-pill" id="statusPill">等待上传</div>
+        <button id="settingsBtn" class="icon-btn" type="button" title="设置" hidden>设置</button>
+      </div>
+    </header>
+
+    <section class="workbench">
+      <aside class="left-panel">
+        <div class="panel-scroll">
+          <section class="control-section product-section">
+            <h2>产品信息</h2>
+            <label class="field">
+              <span>产品名称</span>
+              <input id="productName" type="text" placeholder="如：日本进口浴帽">
+            </label>
+            <label class="field">
+              <span>关键词 / 核心卖点</span>
+              <textarea id="keywords" rows="4" placeholder="如：防水、加厚、轻奢、便携"></textarea>
+            </label>
+          </section>
+
+          <section class="control-section image-edit-section" id="imageEditSection" hidden>
+            <h2>提示词做图</h2>
+            <label class="field">
+              <span>关键词 / 提示词</span>
+              <textarea id="editPrompt" rows="8" placeholder="例如：做一张点击率高的电商主图，黑色产品，蓝色科技光影，高级质感，主体清晰"></textarea>
+            </label>
+            <div class="section-row">
+              <h2>产品图 / 灵感图（可选）</h2>
+              <button id="clearEditBtn" class="mini-btn danger" type="button">清空上传</button>
+            </div>
+            <label class="drop-zone compact-drop collapsible-upload" id="editDrop">
+              <input id="editImages" type="file" accept="image/*" multiple>
+              <span class="drop-icon">+</span>
+              <strong>先上传产品图，可追加灵感参考图</strong>
+              <small>默认首张为产品图、后续为灵感图；若做双图替换，请按“图1=替换产品，图2=模板场景”上传。最多 8 张，支持拖拽 / 点击 / 直接粘贴</small>
+            </label>
+            <div class="preview-row" id="editPreview"></div>
+          </section>
+
+          <section class="control-section strategy-section">
+            <h2>生成策略</h2>
+            <label class="field">
+              <span>优化风格</span>
+              <select id="styleMode">
+                <option value="clean">高点击清爽版</option>
+                <option value="premium">轻奢质感版</option>
+                <option value="functional">卖点强化版</option>
+                <option value="scene">场景氛围版</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>模特 / 人物</span>
+              <select id="modelMode">
+                <option value="auto">根据竞品自动建议</option>
+                <option value="hand">手持展示</option>
+                <option value="half">半身模特使用</option>
+                <option value="none">无人物，只突出产品</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>产品角度</span>
+              <select id="angleMode">
+                <option value="auto">根据竞品自动建议</option>
+                <option value="front">正面主视角</option>
+                <option value="angle45">45 度立体角度</option>
+                <option value="combo">正面 + 侧面组合</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>背景场景</span>
+              <select id="backgroundMode">
+                <option value="auto">根据竞品自动建议</option>
+                <option value="bathroom">明亮浴室</option>
+                <option value="vanity">梳妆台 / 洗漱台</option>
+                <option value="hotel">轻奢酒店浴室</option>
+                <option value="plain">纯色高点击背景</option>
+              </select>
+            </label>
+          </section>
+
+          <section class="control-section ratio-section">
+            <div class="section-row">
+              <h2>画幅比例</h2>
+            </div>
+            <div class="ratio-grid" aria-label="画幅比例">
+              <button class="ratio active" type="button">1:1</button>
+              <button class="ratio" type="button">3:4</button>
+              <button class="ratio" type="button">4:3</button>
+              <button class="ratio" type="button">16:9</button>
+              <button class="ratio" type="button">9:16</button>
+              <button class="ratio" type="button">3:2</button>
+            </div>
+          </section>
+
+          <section class="control-section own-section">
+            <div class="section-row">
+              <h2 id="ownSectionTitle">自己的图片</h2>
+              <button id="clearOwnBtn" class="mini-btn danger" type="button">清空上传</button>
+            </div>
+            <label class="drop-zone compact-drop collapsible-upload" id="ownDrop">
+              <input id="ownImage" type="file" accept="image/*">
+              <span class="drop-icon">+</span>
+              <strong id="ownDropTitle">上传当前图片</strong>
+              <small id="ownDropHint">支持拖拽 / 点击上传</small>
+            </label>
+            <div class="preview-row single" id="ownPreview"></div>
+          </section>
+
+          <section class="control-section competitor-section">
+            <div class="section-row">
+              <h2 id="competitorSectionTitle">竞品 / 参考图</h2>
+              <button id="clearCompetitorsBtn" class="mini-btn danger" type="button">清空上传</button>
+            </div>
+            <label class="drop-zone compact-drop collapsible-upload" id="competitorDrop">
+              <input id="competitorImages" type="file" accept="image/*" multiple>
+              <span class="drop-icon">9</span>
+              <strong id="competitorDropTitle">上传竞品 / 参考图</strong>
+              <small id="competitorDropHint">系统会分析共性优点</small>
+            </label>
+            <div class="preview-row" id="competitorPreview"></div>
+          </section>
+
+          <section class="control-section analysis-section">
+            <div class="panel-head">
+              <h2>分析结果</h2>
+              <div class="panel-actions">
+                <button id="copyPromptBtn" class="mini-btn" type="button" disabled>复制提示词</button>
+                <span id="analysisMeta">未分析</span>
+              </div>
+            </div>
+            <div id="analysisOutput" class="analysis-output">
+              <p>上传自己的主图和竞品参考图后，点击分析。系统会对主体、背景、卖点、模特、角度和场景进行总结。</p>
+            </div>
+          </section>
+        </div>
+
+        <div class="fixed-actions">
+          <div class="api-current"><span></span> 当前应用 API：<b id="currentApiName">未配置</b></div>
+          <div id="generationProgress" class="generation-progress" hidden>
+            <div class="progress-row">
+              <span id="progressText">生成中 0/1</span>
+              <span id="progressPercent">0%</span>
+            </div>
+            <div class="progress-track"><i id="progressBar"></i></div>
+          </div>
+          <button id="analyzeBtn" class="primary-btn" type="button">分析方案</button>
+          <button id="generateBtn" class="primary-btn secondary" type="button" disabled>立即生成</button>
+          <button id="cancelBtn" class="ghost-btn danger-action" type="button" hidden>取消生成</button>
+          <button id="resetBtn" class="ghost-btn" type="button">清空</button>
+        </div>
+      </aside>
+
+      <section class="canvas-stage">
+        <div class="canvas-grid"></div>
+        <div class="stage-content">
+          <div class="canvas-wrap">
+            <canvas id="outputCanvas" width="1200" height="1200" aria-label="优化后的主图"></canvas>
+            <img id="generatedImage" class="generated-image" alt="AI 生成主图">
+            <div id="canvasEmpty" class="canvas-empty">
+              <div class="loading-mark">↻</div>
+              <strong>算法赋能</strong>
+              <span>ALGORITHM EMPOWERED</span>
+              <em>上传主图和竞品图后开始生成</em>
+            </div>
+            <div id="stageLoading" class="stage-loading" hidden>
+              <div class="loading-ring"></div>
+              <strong id="stageLoadingText">生成中...</strong>
+              <span id="stageLoadingMeta">0/1</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <aside class="right-panel">
+        <section class="history-panel">
+          <div class="panel-head">
+            <h2>历史图库</h2>
+            <button id="clearHistoryBtn" class="mini-btn danger" type="button">清理</button>
+          </div>
+          <div class="history-tabs">
+            <button type="button" data-history-mode="main" hidden>以图做图</button>
+            <button class="active" type="button" data-history-mode="edit">提示词做图</button>
+            <button type="button" data-history-mode="develop" hidden>产品开发</button>
+            <button type="button" data-history-mode="clone" hidden>克隆详情</button>
+          </div>
+          <div class="history-list" id="historyList"></div>
+        </section>
+        <button id="downloadBtn" class="primary-btn download-btn" type="button" disabled>下载结果</button>
+      </aside>
+    </section>
+  </main>
+
+  <div id="settingsModal" class="modal-backdrop" aria-hidden="true">
+    <section class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <div class="panel-head">
+        <div>
+          <h2 id="settingsTitle">设置</h2>
+          <p class="modal-subtitle">API 配置会保存在本机，下次启动自动读取。</p>
+        </div>
+        <button id="closeSettingsBtn" class="mini-btn" type="button">关闭</button>
+      </div>
+      <div class="api-config">
+        <div class="panel-head compact">
+          <h2>API 管理</h2>
+          <span id="apiConfigStatus">未检测</span>
+        </div>
+        <div class="settings-grid">
+          <label class="field">
+            <span>API Key</span>
+            <input id="apiKey" type="password" placeholder="粘贴中转站或 OpenAI 的 API Key">
+          </label>
+          <label class="field">
+            <span>API 地址</span>
+            <input id="apiBaseUrl" type="text" placeholder="例如：https://ai.t8star.cn">
+          </label>
+          <label class="field">
+            <span>生图模型</span>
+            <input id="imageModel" type="text" placeholder="例如：gpt-image-2">
+          </label>
+          <label class="field">
+            <span>LLM 模型</span>
+            <input id="llmModel" type="text" placeholder="可选，例如：gemini-3.1-pro-preview">
+          </label>
+        </div>
+        <div class="api-actions">
+          <button id="saveApiConfigBtn" class="primary-btn" type="button">保存 API</button>
+          <button id="testApiConfigBtn" class="ghost-btn" type="button">测试连接</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div id="compareModal" class="compare-modal" aria-hidden="true">
+    <section class="compare-dialog" role="dialog" aria-modal="true" aria-labelledby="compareTitle">
+      <div class="compare-head">
+        <div>
+          <h2 id="compareTitle">图片对比</h2>
+          <p id="compareSubtitle">左侧为上传图，右侧为生成图</p>
+        </div>
+        <button id="closeCompareBtn" class="mini-btn" type="button">关闭</button>
+      </div>
+      <div class="compare-grid">
+        <figure>
+          <figcaption id="compareSourceLabel">上传图</figcaption>
+          <img id="compareSourceImage" alt="上传图片预览">
+        </figure>
+        <figure id="compareGeneratedPane">
+          <figcaption>当前生成图</figcaption>
+          <img id="compareGeneratedImage" alt="生成图片预览">
+        </figure>
+      </div>
+    </section>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>

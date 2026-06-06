@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>登录 - 超迈视觉工具1.0</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body class="auth-page">
+  <main class="auth-card">
+    <div class="brand auth-brand">
+      <div class="brand-mark">AI</div>
+      <div>
+        <h1>超迈视觉工具1.0</h1>
+        <p>登录后使用 AI 视觉工具</p>
+      </div>
+    </div>
+
+    <div class="auth-tabs">
+      <button class="active" type="button" data-auth-tab="login">登录</button>
+      <button type="button" data-auth-tab="register">申请账号</button>
+    </div>
+
+    <form id="loginForm" class="auth-form">
+      <label class="field">
+        <span>账号</span>
+        <input id="username" autocomplete="username" required>
+      </label>
+      <label class="field">
+        <span>密码</span>
+        <input id="password" type="password" autocomplete="current-password" required>
+      </label>
+      <button class="primary-btn" type="submit">登录</button>
+      <p id="loginError" class="form-error"></p>
+    </form>
+
+    <form id="registerForm" class="auth-form" hidden>
+      <label class="field">
+        <span>申请账号</span>
+        <input id="registerUsername" autocomplete="username" placeholder="中文/字母/数字/下划线，2-32 位" required>
+      </label>
+      <label class="field">
+        <span>设置密码</span>
+        <input id="registerPassword" type="password" autocomplete="new-password" placeholder="至少 6 位" required>
+      </label>
+      <label class="field">
+        <span>联系方式</span>
+        <input id="registerContact" placeholder="微信 / 手机 / 公司名">
+      </label>
+      <label class="field">
+        <span>申请说明</span>
+        <textarea id="registerNote" rows="3" placeholder="例如：我是某某店铺，需要主图工具账号"></textarea>
+      </label>
+      <button class="primary-btn" type="submit">提交申请</button>
+      <p id="registerError" class="form-error"></p>
+    </form>
+  </main>
+
+  <script>
+    const tabs = document.querySelectorAll("[data-auth-tab]");
+    const loginForm = document.querySelector("#loginForm");
+    const registerForm = document.querySelector("#registerForm");
+
+    tabs.forEach((tab) => {
+      tab.addEventListener("click", () => {
+        const mode = tab.dataset.authTab;
+        tabs.forEach((item) => item.classList.toggle("active", item === tab));
+        loginForm.hidden = mode !== "login";
+        registerForm.hidden = mode !== "register";
+      });
+    });
+
+    loginForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const error = document.querySelector("#loginError");
+      error.textContent = "";
+      const response = await fetch("/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: document.querySelector("#username").value.trim(),
+          password: document.querySelector("#password").value,
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        error.textContent = result.error || "登录失败";
+        return;
+      }
+      location.href = "/";
+    });
+
+    registerForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const error = document.querySelector("#registerError");
+      error.textContent = "";
+      const response = await fetch("/api/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: document.querySelector("#registerUsername").value.trim(),
+          password: document.querySelector("#registerPassword").value,
+          contact: document.querySelector("#registerContact").value.trim(),
+          note: document.querySelector("#registerNote").value.trim(),
+        }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        error.textContent = result.error || "申请失败";
+        return;
+      }
+      registerForm.reset();
+      error.classList.add("success");
+      error.textContent = result.message || "申请已提交，等待管理员审核";
+    });
+  </script>
+</body>
+</html>
