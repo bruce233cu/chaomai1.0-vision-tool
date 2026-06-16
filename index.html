@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>超迈视觉工具1.0</title>
+  <title>超迈视觉工具1.5</title>
   <link rel="stylesheet" href="./styles.css">
 </head>
 <body>
@@ -12,14 +12,14 @@
       <div class="brand">
         <div class="brand-mark">AI</div>
         <div>
-          <h1>超迈视觉工具1.0</h1>
+          <h1>超迈视觉工具1.5</h1>
           <p>AI 分析竞品优势并生成电商主图</p>
         </div>
       </div>
 
       <nav class="mode-tabs" aria-label="功能导航">
         <button class="tab active" type="button" data-mode="edit">提示词做图</button>
-        <button class="tab" type="button" data-mode="main" hidden>以图做图</button>
+        <button class="tab" type="button" data-mode="main">以图做图</button>
         <button class="tab" type="button" data-mode="develop" hidden>产品开发</button>
         <button class="tab" type="button" data-mode="clone" hidden>克隆详情</button>
       </nav>
@@ -62,8 +62,8 @@
             <label class="drop-zone compact-drop collapsible-upload" id="editDrop">
               <input id="editImages" type="file" accept="image/*" multiple>
               <span class="drop-icon">+</span>
-              <strong>先上传产品图，可追加灵感参考图</strong>
-              <small>默认首张为产品图、后续为灵感图；若做双图替换，请按“图1=替换产品，图2=模板场景”上传。最多 8 张，支持拖拽 / 点击 / 直接粘贴</small>
+              <strong>先上传锁定产品图，可追加灵感参考图</strong>
+              <small>默认首张为锁定产品图、后续为灵感图；若提示词写了图1/图2替换逻辑，系统会按语义自动判断哪张是模板场景、哪张是替换产品。最多 8 张，支持拖拽 / 点击 / 直接粘贴</small>
             </label>
             <div class="preview-row" id="editPreview"></div>
           </section>
@@ -209,7 +209,7 @@
             <button id="clearHistoryBtn" class="mini-btn danger" type="button">清理</button>
           </div>
           <div class="history-tabs">
-            <button type="button" data-history-mode="main" hidden>以图做图</button>
+            <button type="button" data-history-mode="main">以图做图</button>
             <button class="active" type="button" data-history-mode="edit">提示词做图</button>
             <button type="button" data-history-mode="develop" hidden>产品开发</button>
             <button type="button" data-history-mode="clone" hidden>克隆详情</button>

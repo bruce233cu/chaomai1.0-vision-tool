@@ -12,6 +12,8 @@ const host = process.env.HOST || "0.0.0.0";
 const rootWithSep = path.resolve(root) + path.sep;
 const configPath = path.join(root, "api-config.local.json");
 const authPath = path.join(root, "auth.local.json");
+const historyPath = path.join(root, "history.local.json");
+const historyAssetsDir = path.join(root, "history-assets");
 const lastResponsePath = path.join(root, "last-api-response.json");
 const explicitProxyUrl = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.OPENAI_PROXY || "";
 const savedConfig = loadSavedConfig();
@@ -29,6 +31,7 @@ const MODULE_LABELS = {
   clone: "克隆详情",
 };
 const authStore = loadAuthStore();
+const historyStore = loadHistoryStore();
 const sessions = new Map();
 
 const mime = {
@@ -102,6 +105,141 @@ function loadAuthStore() {
 
 function saveAuthStore(store = authStore) {
   fs.writeFileSync(authPath, JSON.stringify(store, null, 2), "utf8");
+}
+
+function createEmptyHistoryBuckets() {
+  return { edit: [], main: [], develop: [], clone: [] };
+}
+
+function loadHistoryStore() {
+  try {
+    if (!fs.existsSync(historyPath)) {
+      return { users: {} };
+    }
+    const parsed = JSON.parse(fs.readFileSync(historyPath, "utf8"));
+    const users = parsed && typeof parsed === "object" ? parsed.users || {} : {};
+    const normalizedUsers = {};
+    Object.entries(users).forEach(([userId, modes]) => {
+      normalizedUsers[String(userId)] = normalizeHistoryBuckets(modes);
+    });
+    return { users: normalizedUsers };
+  } catch (error) {
+    return { users: {} };
+  }
+}
+
+function saveHistoryStore(store = historyStore) {
+  fs.writeFileSync(historyPath, JSON.stringify(store, null, 2), "utf8");
+}
+
+function normalizeHistoryBuckets(input = {}) {
+  const buckets = createEmptyHistoryBuckets();
+  MODULE_KEYS.forEach((mode) => {
+    const items = Array.isArray(input[mode]) ? input[mode] : [];
+    buckets[mode] = items
+      .map((item) => normalizeHistoryEntry(item, mode))
+      .filter(Boolean)
+      .slice(0, 12);
+  });
+  return buckets;
+}
+
+function normalizeHistoryEntry(item, mode) {
+  if (!item || typeof item !== "object") return null;
+  if (!item.id || !item.fileName) return null;
+  return {
+    id: String(item.id),
+    label: String(item.label || MODULE_LABELS[mode] || "最新"),
+    fileName: String(item.fileName),
+    mimeType: String(item.mimeType || "image/png"),
+    createdAt: String(item.createdAt || new Date().toISOString()),
+  };
+}
+
+function getUserHistoryBuckets(userId) {
+  const key = String(userId);
+  if (!historyStore.users[key]) {
+    historyStore.users[key] = createEmptyHistoryBuckets();
+  }
+  return historyStore.users[key];
+}
+
+function historyAssetUrl(userId, fileName) {
+  return `/api/history/assets/${encodeURIComponent(String(userId))}/${encodeURIComponent(String(fileName))}`;
+}
+
+function getUserHistoryPayload(user) {
+  const buckets = normalizeHistoryBuckets(getUserHistoryBuckets(user.id));
+  const payload = {};
+  MODULE_KEYS.forEach((mode) => {
+    payload[mode] = buckets[mode].map((item) => ({
+      id: item.id,
+      label: item.label,
+      mode,
+      time: item.createdAt,
+      src: historyAssetUrl(user.id, item.fileName),
+    }));
+  });
+  return payload;
+}
+
+function safeUnlink(filePath) {
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch (error) {
+    // Ignore cleanup failures.
+  }
+}
+
+function persistHistoryImage(user, mode, imageSrc, label) {
+  const image = parseDataUrl(imageSrc);
+  const userDir = path.join(historyAssetsDir, String(user.id));
+  fs.mkdirSync(userDir, { recursive: true });
+  const extension = image.fileName.split(".").pop() || "png";
+  const fileName = `${Date.now()}-${crypto.randomUUID()}.${extension}`;
+  fs.writeFileSync(path.join(userDir, fileName), image.buffer);
+
+  const buckets = getUserHistoryBuckets(user.id);
+  const bucket = buckets[mode] || (buckets[mode] = []);
+  bucket.unshift({
+    id: crypto.randomUUID(),
+    label: String(label || MODULE_LABELS[mode] || "最新"),
+    fileName,
+    mimeType: image.mimeType,
+    createdAt: new Date().toISOString(),
+  });
+
+  while (bucket.length > 12) {
+    const removed = bucket.pop();
+    if (removed?.fileName) {
+      safeUnlink(path.join(userDir, removed.fileName));
+    }
+  }
+
+  saveHistoryStore();
+}
+
+function clearHistoryForUser(user, mode) {
+  const buckets = getUserHistoryBuckets(user.id);
+  const modes = mode ? [mode] : MODULE_KEYS;
+  const userDir = path.join(historyAssetsDir, String(user.id));
+  modes.forEach((key) => {
+    const bucket = Array.isArray(buckets[key]) ? buckets[key] : [];
+    bucket.forEach((item) => {
+      if (item?.fileName) safeUnlink(path.join(userDir, item.fileName));
+    });
+    buckets[key] = [];
+  });
+  saveHistoryStore();
+}
+
+function resolveHistoryAssetPath(ownerId, fileName) {
+  const safeOwner = String(ownerId || "").trim();
+  const safeFileName = path.basename(String(fileName || "").trim());
+  if (!safeOwner || !safeFileName) return "";
+  const assetPath = path.resolve(historyAssetsDir, safeOwner, safeFileName);
+  const ownerDir = path.resolve(historyAssetsDir, safeOwner) + path.sep;
+  return assetPath.startsWith(ownerDir) ? assetPath : "";
 }
 
 function defaultModuleLimits() {
@@ -398,12 +536,31 @@ function validateApiConfigInput(payload) {
   }
 }
 
+function getOwnImageSet(payload, limit = 4) {
+  const images = [];
+  const primary = String(payload.ownImage || "").trim();
+  if (primary) {
+    images.push(primary);
+  }
+  if (Array.isArray(payload.ownImages)) {
+    payload.ownImages.forEach((src) => {
+      const normalized = String(src || "").trim();
+      if (normalized && !images.includes(normalized)) {
+        images.push(normalized);
+      }
+    });
+  }
+  return images.slice(0, limit);
+}
+
 async function generateImage(payload) {
   ensureApiReady();
   const imageSize = resolveImageSize(payload.aspectRatio);
   const strictReplacementMode = payload.sourceMode === "two-image-replacement";
+  const ownImages = getOwnImageSet(payload, 4);
+  const primaryOwnImage = ownImages[0] || "";
 
-  if (!payload.ownImage) {
+  if (!primaryOwnImage) {
     const response = await proxyFetch(`${apiConfig.apiBaseUrl}/images/generations`, {
       method: "POST",
       headers: {
@@ -429,7 +586,7 @@ async function generateImage(payload) {
     throw new Error(`API 没有返回可识别的图片数据。返回字段：${summarizeApiShape(result)}`);
   }
 
-  const image = parseDataUrl(payload.ownImage);
+  const image = parseDataUrl(primaryOwnImage);
   const form = new FormData();
   form.append("model", apiConfig.imageModel);
   form.append("size", imageSize);
@@ -437,6 +594,11 @@ async function generateImage(payload) {
   form.append("n", "1");
   form.append("prompt", payload.prompt);
   form.append("image", new Blob([image.buffer], { type: image.mimeType }), image.fileName);
+  ownImages.slice(1).forEach((src, index) => {
+    if (!src) return;
+    const ref = parseDataUrl(src);
+    form.append("image", new Blob([ref.buffer], { type: ref.mimeType }), `product-view-${index + 2}.${ref.fileName.split(".").pop() || "png"}`);
+  });
   if (Array.isArray(payload.referenceImages)) {
     payload.referenceImages.slice(0, 4).forEach((src, index) => {
       if (!src) return;
@@ -459,7 +621,7 @@ async function generateImage(payload) {
   }
 
   let result = await readApiResult(response);
-  if (!strictReplacementMode && !response.ok && shouldFallbackToGeneration(result)) {
+  if (!strictReplacementMode && ownImages.length <= 1 && !response.ok && shouldFallbackToGeneration(result)) {
     response = await proxyFetch(`${apiConfig.apiBaseUrl}/images/generations`, {
       method: "POST",
       headers: {
@@ -498,9 +660,15 @@ async function analyzeImages(payload) {
   if (!apiConfig.llmModel) {
     throw new Error("缺少 LLM 模型，请在设置里填写支持视觉分析的 LLM 模型");
   }
-  if (!payload.ownImage || !Array.isArray(payload.competitorImages) || payload.competitorImages.length === 0) {
+  const ownImages = getOwnImageSet(payload, 4);
+  if (!ownImages.length || !Array.isArray(payload.competitorImages) || payload.competitorImages.length === 0) {
     throw new Error("请上传自己的主图和至少 1 张竞品图");
   }
+
+  const ownProductParts = ownImages.flatMap((src, index) => ([
+    { type: "text", text: index === 0 ? "用户自己的当前产品图（主视角）" : `同一产品的补充角度 ${index + 1}` },
+    { type: "image_url", image_url: { url: src } },
+  ]));
 
   const competitorParts = payload.competitorImages.slice(0, 9).flatMap((src, index) => ([
     { type: "text", text: `竞品主图 ${index + 1}` },
@@ -522,8 +690,7 @@ async function analyzeImages(payload) {
             type: "text",
             text: buildAnalysisInstruction(payload),
           },
-          { type: "text", text: "用户自己的当前主图" },
-          { type: "image_url", image_url: { url: payload.ownImage } },
+          ...ownProductParts,
           ...competitorParts,
         ],
       },
@@ -557,7 +724,7 @@ async function analyzeImages(payload) {
   }
 
   const content = extractTextResult(result);
-  const analysis = parseJsonFromText(content);
+  const analysis = parseJsonOrPromptPayload(content);
   return normalizeAnalysisResult(analysis, payload);
 }
 
@@ -571,9 +738,6 @@ async function analyzeEditReference(payload) {
     : payload.referenceImage
       ? [payload.referenceImage]
       : [];
-  if (!payload.productImage && !inspirationImages.length) {
-    throw new Error("请至少上传 1 张产品图或灵感参考图");
-  }
 
   const requestBody = {
     model: apiConfig.llmModel,
@@ -581,7 +745,7 @@ async function analyzeEditReference(payload) {
     messages: [
       {
         role: "system",
-        content: "你是资深电商广告 Prompt 编译总监，擅长把用户需求、产品图和参考图优点编译成高完成度的英文电商广告 Prompt。只输出 JSON，不要输出 Markdown。",
+        content: "你是资深电商广告 Prompt 编译总监兼高级提示词架构师，擅长把简短用户需求、产品图和参考图优点，编译成高完成度的英文电商广告 Prompt。只输出 JSON，不要输出 Markdown。",
       },
       {
         role: "user",
@@ -666,9 +830,9 @@ async function analyzeReplacementTask(payload) {
             type: "text",
             text: buildReplacementPlanInstruction(payload),
           },
-          { type: "text", text: "Image 1: locked template scene" },
+          { type: "text", text: `User-designated locked template scene (uploaded image ${payload.templateIndex || 1})` },
           { type: "image_url", image_url: { url: payload.templateImage } },
-          { type: "text", text: "Image 2: replacement product source" },
+          { type: "text", text: `User-designated replacement product source (uploaded image ${payload.replacementIndex || 2})` },
           { type: "image_url", image_url: { url: payload.replacementImage } },
         ],
       },
@@ -742,94 +906,496 @@ function buildAnalysisInstruction(payload) {
   }
 
   return [
-    "????????????????????????????????????????????????? Midjourney / Stable Diffusion / GPT-Image ?????????",
+    "You are a top-tier e-commerce visual director with elite commercial taste, blockbuster main-image deconstruction ability, and expert prompt engineering skills for GPT-Image, Midjourney, and Stable Diffusion.",
     "",
-    "???????????????",
-    "1. ??????????? / ?????????????????????",
-    "2. ?????????????????????? proprietary product layer???????????????????",
-    "3. ????????????????????????????????????????????? AI ??????",
+    "I will give you:",
+    "1. one or more images of the user's own product / current product, which may include multiple angles of the same exact product",
+    "2. one or more competitor reference images",
     "",
-    "???????????",
-    "1. ?????",
-    "2. ?????????",
-    "3. ???????",
-    "4. ????????",
-    "5. ???????????????",
-    "6. ????????????",
+    "Your task is not to copy the competitor image. Your task is to deeply deconstruct the real commercial strengths behind the competitor reference image, then translate those strengths into one high-finish English generationPrompt that can be used directly in GPT-Image to upgrade the user's own product image.",
     "",
-    "???????????????????????????????????????????????????????? Prompt?",
-    "?? generationPrompt ????????????????????????????????????????????????????????????????????",
+    "Your final goal is not to make the result look identical to the reference image. Your final goal is to keep the user's product identity and key details correct, while absorbing the reference image's product proportion, human-product-scene relationship, composition, lighting, camera language, layout rhythm, premium mood, and click-through logic, so the final output feels more like a mature branded marketplace advertisement.",
     "",
-    "???????????",
-    "1. ?????????????????????????????????????????????",
-    "2. ????????????Logo???????????????????????????????????????",
-    "3. ????????????????????????????????????????????????????????????????????????????????",
-    "4. generationPrompt ??????????????????????????????????????????????",
-    "5. generationPrompt ??????????????? proprietary product layer absolutely does not deform?????????????????????????????????????????????????",
-    "6. generationPrompt ????????????????????????????? premium e-commerce hero image / high-end marketplace main image / commercial ad banner quality?",
-    "7. generationPrompt ??????????????????????????????????????????????????",
-    "8. ????????????????? generic headline area?generic feature badge area?generic promo ribbon area?generic info block area????????????????",
-    "9. generationPrompt ???????????????????????????????????",
+    "You must strictly follow the rules below.",
     "",
-    "?? generationPrompt ??????????????????????????????",
-    "- overall art direction and tone",
-    "- composition and visual flow",
-    "- model / lifestyle support if useful",
-    "- product scale and focus",
-    "- lighting, reflections, atmospheric depth, material rendering",
-    "- premium ad finish and marketplace hero quality",
-    "- strict product-lock instructions",
-    "- negative exclusions for copied branding / distortion / ugly artifacts",
+    "Section 1: about the user's own product (highest priority)",
+    "1. The user's product must be treated as a locked proprietary product layer / fixed product identity.",
+    "2. The product's exact silhouette, exact structure, exact proportions, exact material segmentation, exact color blocking, exact zipper placement, exact straps, exact pockets, exact hardware, exact tags, exact seams, exact outline, and all product-defining identity details must remain consistent.",
+    "2.5. If multiple own product images are provided, they are different angles of the same exact product. You must fuse them into one single locked product identity and use them together to preserve cross-view consistency in the final result.",
+    "3. You must never turn the user's product into another product, and you must never alter the product-defining identity.",
+    "4. However, you must understand this clearly: the product identity is locked, but the presentation relationship may be rebuilt according to the reference image logic.",
+    "5. That means if the reference image shows the product on a model's back, in a hand, on a tabletop, on a display platform, in an outdoor travel context, or in a lifestyle scene, then the final generationPrompt may allow the user's own product to enter the same type of commercial relationship naturally.",
+    "6. In other words: product identity must stay locked, but the display method, product proportion, composition relationship, model relationship, lighting relationship, and camera relationship should follow the deconstructed logic of the reference image.",
     "",
-    `?????${payload.productName || "???"}` ,
-    `??? / ???${payload.keywords || "???"}` ,
-    `?????${payload.aspectRatio || "1:1"}` ,
+    "Section 2: about the competitor reference image",
+    "1. The competitor reference image is for deconstruction only and must never be copied directly.",
+    "2. You are not allowed to copy brand names, logos, original copywriting, prices, campaign texts, watermarks, QR codes, store information, or trademark-like typography from the reference image.",
+    "3. You are allowed to absorb:",
+    "- product proportion in frame",
+    "- product-to-model scale relationship",
+    "- product-to-camera distance relationship",
+    "- product-to-background and product-to-layout-zone relationship",
+    "- composition structure and visual flow",
+    "- lighting logic and camera language",
+    "- depth, background layering, and blur handling",
+    "- rhythm of headline area, feature area, badge area, promo area, CTA area, and negative space",
+    "- commercial mood, lifestyle projection, marketplace click appeal, and thumbnail readability",
     "",
-    "???? JSON??? Markdown?????????????",
+    "Section 3: you must deeply deconstruct the reference image across these dimensions",
+    "1. sceneTone",
+    "- what kind of commercial scene this is",
+    "- what consumer imagination it builds",
+    "- why it feels premium, attractive, trustworthy, lightweight, aspirational, or worth clicking",
+    "- how the scene supports product selling points instead of stealing attention",
+    "",
+    "2. hierarchy",
+    "- how headline, feature, icon, promo, CTA, and empty space are organized",
+    "- why the information can be understood at first glance",
+    "- which areas attract attention first and which areas support the sales message",
+    "- why the product still remains the hero instead of being overwhelmed by layout elements",
+    "",
+    "3. composition",
+    "- relationship among product, model, background, selling-point zones, and negative space",
+    "- first visual landing point, second landing point, third landing point",
+    "- how the eye flows through the image",
+    "- why this structure is beneficial for click-through and conversion",
+    "- why the product feels dominant in the composition",
+    "",
+    "4. marketing",
+    "- how the image creates desire, quality perception, lifestyle immersion, price justification, and purchase impulse",
+    "- why it feels like a mature branded advertisement instead of an ordinary product image",
+    "",
+    "5. productFocus (critical)",
+    "- the product's scale in frame",
+    "- the product-to-model scale relationship",
+    "- the product's dominance relative to background and layout zones",
+    "- why the product becomes the first visual hero",
+    "- you must clearly extract this because the later generationPrompt must imitate the reference image's product proportion, product dominance, and product visual weight at a one-to-one logic level",
+    "",
+    "6. modelSupport (critical)",
+    "- whether the model is hero or support",
+    "- how the model's pose serves the product",
+    "- how the model helps place the product naturally into a commercial scene",
+    "- if the reference image contains a person, you must deconstruct the human-product-scene relationship rather than merely saying there is a model",
+    "- if the product in the reference image is worn, carried, held, displayed, or supported in a specific way, the later generationPrompt must allow the user's own product to enter the same type of display logic while keeping the product itself unchanged",
+    "",
+    "7. lightingCamera (critical)",
+    "You must deconstruct this like a visual master. Do not use vague phrases like premium lighting or premium angle only.",
+    "You must clearly analyze:",
+    "- key light direction",
+    "- fill light relationship",
+    "- rim light presence or absence",
+    "- contact shadow and cast shadow direction",
+    "- reflected light source",
+    "- color temperature",
+    "- depth of field and background blur handling",
+    "- camera angle",
+    "- camera height",
+    "- product orientation",
+    "- spatial layering between product and background",
+    "- why this lighting and camera setup makes the product feel more premium and more clickable",
+    "",
+    "Section 4: rules for generating the final generationPrompt",
+    "1. generationPrompt must be one complete, single-paragraph, pure-English prompt that can be copied directly into GPT-Image.",
+    "2. No markdown, no explanations, no multiple versions, no Chinese prompt.",
+    "3. generationPrompt is not an analysis report. It is a final image-directing prompt.",
+    "4. generationPrompt must first make clear that the uploaded product is a locked proprietary product layer / fixed product identity.",
+    "5. It must explicitly state that the exact silhouette, exact structure, exact proportions, exact material segmentation, exact color blocking, exact zippers, exact straps, exact pockets, exact hardware, exact tags, exact seams, exact outline, and exact product-defining details must remain unchanged.",
+    "5.5. If multiple own product images are provided, generationPrompt must explicitly treat them as multi-view references of the same proprietary product and preserve consistency across all visible and inferred angles.",
+    "6. It must explicitly include language equivalent to: do not deform, redesign, simplify, repaint, recolor, resize, rotate, replace, or alter product-defining features.",
+    "7. generationPrompt must also explicitly state that the product identity is locked, but the presentation relationship may imitate the commercial expression logic deconstructed from the reference image.",
+    "8. If the reference image shows the product on a model, in a hand, on a table, or in a specific contextual scene, then the user's own product may enter the same type of relationship naturally, while the product itself remains unchanged.",
+    "9. generationPrompt must imitate the reference image's product proportion and hierarchy logic, including:",
+    "- product scale in frame",
+    "- product-to-model scale relationship",
+    "- product placement in layout",
+    "- relationship with selling-point zones, negative space, and background",
+    "- first-screen visual focal order and flow",
+    "10. generationPrompt must imitate the deconstructed lighting and camera logic, including:",
+    "- key light direction",
+    "- fill light relationship",
+    "- rim light logic",
+    "- contact shadow",
+    "- cast shadow direction",
+    "- reflected light source",
+    "- background blur handling",
+    "- depth relationship",
+    "- camera angle",
+    "- camera height",
+    "- product orientation",
+    "- spatial layering between product and background",
+    "11. generationPrompt must read like a true commercial visual director's brief, and must demonstrate:",
+    "- art direction",
+    "- composition hierarchy",
+    "- product dominance",
+    "- product-to-model relationship",
+    "- product-to-camera scale relationship",
+    "- thumbnail readability",
+    "- lighting choreography",
+    "- contact shadow logic",
+    "- reflected light logic",
+    "- material rendering",
+    "- atmospheric depth",
+    "- breathable negative space",
+    "- premium ad-retouching finish",
+    "- high-end marketplace hero quality",
+    "- strong click-through appeal",
+    "12. generationPrompt may retain generic commercial layout structure, but must not copy real brand assets from the reference image.",
+    "It may describe:",
+    "- generic headline zone",
+    "- generic feature badge zone",
+    "- generic promo block",
+    "- generic CTA-ready area",
+    "- copy-safe negative space",
+    "These layout zones must remain blank or unreadable placeholder structures only, and must not reproduce real brand names, logos, slogans, prices, event texts, watermarks, or QR codes from the reference image.",
+    "13. generationPrompt must absorb the true source of premium quality from the reference image, and must not stay at abstract adjectives only. Translate that quality into executable visual language such as:",
+    "- product-first commercial hierarchy",
+    "- elegant tonal separation",
+    "- high-contrast thumbnail readability",
+    "- clean subject-to-background separation",
+    "- realistic contact shadows at the base",
+    "- subtle reflected light on the shadow side",
+    "- refined highlight control on materials",
+    "- restrained lifestyle support",
+    "- breathable layout rhythm",
+    "- polished marketplace retouching feel",
+    "14. The final generationPrompt should drive an image where:",
+    "- the user's product identity and details remain correct",
+    "- the product may naturally enter the same display relationship as the reference image",
+    "- the product proportion, composition, model relationship, lighting relationship, and camera logic feel as mature as the reference image",
+    "- the result feels like a premium branded marketplace advertisement",
+    "- the thumbnail has strong first-glance pull",
+    "- the product remains the undeniable hero",
+    "- the commercial atmosphere is strong",
+    "- the premium feeling is strong",
+    "- the platform click-through logic is valid",
+    "",
+    `Product name: ${payload.productName || "not provided"}`,
+    `Keywords: ${payload.keywords || "not provided"}`,
+    `Canvas aspect ratio: ${payload.aspectRatio || "1:1"}`,
+    "",
+    "Return JSON only, no markdown, no explanations:",
     "{",
-    "  \"scores\": {\"overall\": number, \"background\": number, \"focus\": number},",
     "  \"visualDimensions\": {",
-    "    \"sceneTone\": \"??????????????\",",
-    "    \"hierarchy\": \"??????????????????\",",
-    "    \"composition\": \"????????????????\",",
-    "    \"marketing\": \"?????????????????\",",
-    "    \"productFocus\": \"???????????????????\",",
-    "    \"modelSupport\": \"????????????????????\"",
+    "    \"sceneTone\": \"Chinese string\",",
+    "    \"hierarchy\": \"Chinese string\",",
+    "    \"composition\": \"Chinese string\",",
+    "    \"marketing\": \"Chinese string\",",
+    "    \"productFocus\": \"Chinese string\",",
+    "    \"modelSupport\": \"Chinese string\",",
+    "    \"lightingCamera\": \"Chinese string\"",
     "  },",
-    "  \"generationPrompt\": \"???????????????????????? AI ?? Prompt??????? proprietary product layer absolutely does not deform????? premium e-commerce ad finish, cinematic commercial polish, clean visual hierarchy, material contrast, atmospheric depth, sophisticated retouching feel\"",
+    "  \"competitorAdvantages\": [\"Chinese string\", \"Chinese string\"],",
+    "  \"commonPatterns\": [\"Chinese string\", \"Chinese string\"],",
+    "  \"strategy\": [\"Chinese string\", \"Chinese string\"],",
+    "  \"creative\": {",
+    "    \"model\": \"Chinese string\",",
+    "    \"angle\": \"Chinese string\",",
+    "    \"background\": \"Chinese string\",",
+    "    \"subjectRatio\": \"Chinese string\",",
+    "    \"lighting\": \"Chinese string\"",
+    "  },",
+    "  \"generationPrompt\": \"one complete English commercial prompt for GPT-Image\"",
     "}",
-    "",
-    "??? JSON?",
   ].join("\n");
 }
+
+function inferCommercialCategory(promptText = "", productName = "") {
+  const text = `${productName} ${promptText}`.toLowerCase();
+  if (/(吹风机|电吹风|hair\s*dryer|dryer|styler|straightener|curling|卷发棒|夹板)/i.test(text)) return "haircare";
+  if (/(背包|双肩包|书包|包包|backpack|bag|tote|luggage|travel bag|satchel)/i.test(text)) return "bag";
+  if (/(水杯|保温杯|杯子|马克杯|bottle|flask|tumbler|mug|cup)/i.test(text)) return "drinkware";
+  if (/(口红|粉底|护肤|面霜|精华|香水|彩妆|cosmetic|skincare|makeup|serum|cream|perfume|lipstick)/i.test(text)) return "beauty";
+  if (/(礼盒|月饼|糕点|食品|零食|gift box|hamper|snack|pastry|festival box|mooncake)/i.test(text)) return "gift";
+  if (/(耳机|音箱|手机壳|数据线|充电器|数码|headphone|earbud|speaker|phone case|charger|cable)/i.test(text)) return "electronics";
+  if (/(首饰|项链|手表|戒指|耳环|jewelry|necklace|watch|ring|earring)/i.test(text)) return "jewelry";
+  return "generic";
+}
+
+function promptHasSignal(promptText, dimension) {
+  const text = String(promptText || "");
+  const map = {
+    material: /(材质|金属|哑光|磨砂|皮革|织物|尼龙|玻璃|陶瓷|木纹|matte|glossy|metal|fabric|nylon|leather|glass|ceramic|woodgrain|brushed)/i,
+    lighting: /(光|光影|逆光|柔光|阴影|侧光|窗光|日光|打光|lighting|sunlight|shadow|rim light|softbox|window light|backlight|warm light)/i,
+    camera: /(镜头|景深|虚化|特写|构图|广角|85mm|50mm|微距|bokeh|depth of field|close-up|macro|cropped|telephoto)/i,
+    scene: /(背景|场景|桌面|台面|窗边|浴室|海边|户外|室内|卧室|客厅|厨房|梳妆台|background|scene|interior|bathroom|vanity|tabletop|outdoor|coastal|kitchen|bedroom|studio)/i,
+  };
+  return map[dimension]?.test(text) || false;
+}
+
+function getCommercialBlueprint(category) {
+  const shared = {
+    finish: "Final finish: premium e-commerce hero quality, cinematic commercial polish, clean visual hierarchy, believable material separation, atmospheric depth, refined retouching, and strong click-through appeal.",
+    exclusions: "Negative exclusions: no copied brand names, logos, slogans, prices, watermarks, QR codes, random text, garbled typography, cheap collage feeling, low-resolution artifacts, or blurry hero-subject edges.",
+  };
+  const map = {
+    haircare: {
+      materialFree: "Material direction: refined matte or satin-touch body finish, fingerprint-resistant surface feel, precise parting lines, subtle premium trim control, and clean high-end appliance detailing.",
+      materialLocked: "Read the uploaded product's observed material truthfully: preserve the exact body finish, trim logic, buttons, vents, nozzle form, seams, and surface texture; only elevate how those details are lit and rendered.",
+      lighting: "Lighting direction: studio-grade softbox key light blended with gentle window-side daylight, soft warm highlights, controlled rim light around the silhouette, and flattering beauty-ad tonal balance.",
+      camera: "Camera direction: premium 85mm commercial product-and-beauty lens look, shallow depth of field, clean bokeh falloff, crisp hero focus, and ultra-clear ad-grade sharpness.",
+      scene: "Scene direction: a refined warm home-care environment such as a modern vanity, airy cream-toned wash area, or softly sunlit tabletop with calm premium styling.",
+      composition: "Composition direction: keep the hero product or the product-with-model relationship as the first visual focal point, with generous breathable negative space and a high-conversion ad layout rhythm.",
+      support: "If a lifestyle model is used, keep the pose elegant and supportive, with natural hand interaction and believable beauty-ad posture rather than theatrical fashion posing.",
+    },
+    bag: {
+      materialFree: "Material direction: structured woven fabric or coated textile feel, crisp seam definition, subtle micro-wrinkles, restrained hardware sheen, and premium everyday durability cues.",
+      materialLocked: "Read the uploaded bag exactly as photographed: preserve its true fabric family, seams, pockets, zipper path, strap thickness, hardware placement, labels, printed details, and color-block structure; only improve lighting, edge clarity, and material depth.",
+      lighting: "Lighting direction: bright commercial daylight with soft directional fill, believable side sunlight, delicate rim separation, realistic contact shadows, and clean atmospheric depth.",
+      camera: "Camera direction: premium 85mm marketplace ad lens look with shallow background blur, crisp edge definition on the bag, realistic depth compression, and polished hero-subject sharpness.",
+      scene: "Scene direction: a clean outdoor-travel or commute-lifestyle environment such as a coastal path, modern transit setting, or bright airy travel platform without visual clutter.",
+      composition: "Composition direction: make the bag the dominant hero subject with strong silhouette readability, clear scale hierarchy, and an ad-friendly balance between product, background depth, and optional info layout zones.",
+      support: "If a model is used, the bag may be naturally worn or held, but the product must remain the commercial hero rather than becoming a background accessory.",
+    },
+    drinkware: {
+      materialFree: "Material direction: premium metal, coated ceramic, or clean engineered plastic rendering with restrained specular control, refined edge highlights, and premium tactile finish.",
+      materialLocked: "Read the uploaded drinkware exactly as it appears: preserve the true body proportions, lid structure, handle logic, spout details, surface finish, material zones, and printed elements; only elevate realism through lighting and micro-contrast.",
+      lighting: "Lighting direction: soft premium tabletop light with controlled highlights, realistic reflections, gentle side illumination, and polished catalog-grade contrast.",
+      camera: "Camera direction: clean 85mm or short-tele commercial still-life lens look, shallow depth of field, crisp focal plane on the hero product, and extremely clean product photography sharpness.",
+      scene: "Scene direction: a refined tabletop, breakfast nook, or calm hospitality-inspired lifestyle setting with soft premium restraint.",
+      composition: "Composition direction: keep the product centered in a calm, premium still-life composition with strong material readability and elegant negative space.",
+      support: "Use supporting props only if they feel restrained, relevant, and secondary to the product.",
+    },
+    beauty: {
+      materialFree: "Material direction: luxe beauty-pack finish, refined matte or glossy surface control, crisp label area handling, subtle metallic accents, and delicate tactile realism.",
+      materialLocked: "Read the uploaded beauty product faithfully: preserve its bottle, cap, pump, label area, finish, proportions, and decorative details exactly, while only upgrading material realism and surface lighting.",
+      lighting: "Lighting direction: soft beauty-campaign illumination with diffused glow, graceful highlight rolloff, fine edge light, and elegant skin-or-surface flattering warmth.",
+      camera: "Camera direction: premium beauty still-life photography, 85mm commercial lens look, shallow depth of field, subtle bokeh, and pristine high-resolution finish.",
+      scene: "Scene direction: a refined vanity, marble or cream-toned tabletop, softly sunlit beauty corner, or elegant editorial home-care environment.",
+      composition: "Composition direction: keep the product dominant while surrounding it with beauty-campaign atmosphere, clean negative space, and polished conversion-ready hierarchy.",
+      support: "If a model or hand is present, it should feel elegant, restrained, and naturally supportive of the hero product.",
+    },
+    gift: {
+      materialFree: "Material direction: premium paperboard, embossed patterning, fabric or ribbon accents, lacquer-like color richness, and ceremonial packaging craftsmanship.",
+      materialLocked: "Read the uploaded gift packaging exactly: preserve the box structure, handle logic, embossed or printed pattern zones, trim, tassels, ribbons, and material layering while only elevating depth, shadow, and surface richness.",
+      lighting: "Lighting direction: luxurious directional studio light with controlled festive warmth, dimensional highlight placement, soft shadow transitions, and premium ceremonial atmosphere.",
+      camera: "Camera direction: high-end commercial packaging photography with crisp hero focus, elegant depth separation, and polished premium advertising sharpness.",
+      scene: "Scene direction: a refined festive display environment with tasteful wood, fabric, lacquer, or ceremonial tabletop cues, while keeping the packaging dominant.",
+      composition: "Composition direction: build a premium presentation with strong frontal readability, rich but controlled atmosphere, and clear premium gift-value storytelling.",
+      support: "Hands or wardrobe support may appear if needed, but they must serve the packaging hero and preserve premium ceremony cues.",
+    },
+    electronics: {
+      materialFree: "Material direction: refined engineered surfaces, anti-smudge finish, precise seam control, subtle metallic or glass accents, and premium consumer-tech detailing.",
+      materialLocked: "Read the uploaded device faithfully: preserve its exact housing geometry, buttons, ports, trims, textures, and material segmentation while only improving light behavior and tactile realism.",
+      lighting: "Lighting direction: premium commercial studio lighting with controlled contrast, soft reflections, subtle rim separation, and elegant high-tech polish without harsh glare.",
+      camera: "Camera direction: premium commercial product-photography lens look, shallow depth of field when useful, tack-sharp device edges, and crisp tech-ad clarity.",
+      scene: "Scene direction: a restrained modern environment such as a clean desk, minimal lifestyle interior, or softly lit premium tech setup with low clutter.",
+      composition: "Composition direction: emphasize clarity, precision, and premium object presence with clean geometry and strong visual hierarchy.",
+      support: "Lifestyle support should feel minimal, modern, and secondary to the product's form and usability cues.",
+    },
+    jewelry: {
+      materialFree: "Material direction: high-fidelity precious-metal rendering, elegant highlight control, refined gemstone sparkle, and luxurious surface polish.",
+      materialLocked: "Read the uploaded jewelry faithfully: preserve its exact form, setting, proportions, clasp or band logic, surface detailing, and stone placement while only enhancing shine, depth, and realism.",
+      lighting: "Lighting direction: elegant luxury-product lighting with pinpoint sparkle control, soft fill, premium edge highlights, and refined depth.",
+      camera: "Camera direction: macro-luxury commercial lens feel, shallow depth of field, crisp subject plane, and ultra-clean high-end advertising sharpness.",
+      scene: "Scene direction: a restrained premium jewelry environment such as velvet, stone, or soft editorial tabletop styling with elegant negative space.",
+      composition: "Composition direction: keep the jewelry visually precious, isolated, and dominant, with luxurious material contrast and uncluttered sophistication.",
+      support: "If hands or model cues appear, they must remain understated and premium.",
+    },
+    generic: {
+      materialFree: "Material direction: premium matte-to-satin finish control, clear edge definition, refined tactile realism, and believable commercial-grade surface treatment.",
+      materialLocked: "Read the uploaded product faithfully from the source image: preserve its true structure, materials, edges, seams, prints, hardware, and finish while only upgrading lighting response and realism.",
+      lighting: "Lighting direction: studio-grade soft directional lighting with refined fill, subtle rim separation, believable highlights, controlled shadows, and premium commercial depth.",
+      camera: "Camera direction: premium 85mm commercial hero-shot lens feel, shallow depth of field where useful, crisp focal priority on the hero product, and ultra-clean ad-grade clarity.",
+      scene: "Scene direction: a tasteful premium lifestyle or tabletop setting that fits the product naturally, with clean negative space and restrained styling.",
+      composition: "Composition direction: maintain strong hero-subject dominance, balanced breathing room, polished marketplace hierarchy, and believable commercial staging.",
+      support: "Lifestyle support is allowed only when it strengthens the product story without stealing attention from the hero subject.",
+    },
+  };
+  return {
+    ...shared,
+    ...(map[category] || map.generic),
+  };
+}
+
+function getStyleDirective(payload) {
+  const styleMode = String(payload.styleMode || "clean");
+  const map = {
+    clean: "Art direction: clean, high-click, marketplace-friendly hero image with polished simplicity.",
+    premium: "Art direction: premium, refined, upscale marketplace hero image with elevated material feel.",
+    functional: "Art direction: feature-forward, conversion-focused marketplace hero image with strong clarity and selling-point readability.",
+    scene: "Art direction: scene-rich, lifestyle-driven marketplace hero image with commercial polish and atmospheric storytelling.",
+  };
+  return map[styleMode] || map.clean;
+}
+
+function getModelDirective(payload) {
+  const modelMode = String(payload.modelMode || "auto");
+  const map = {
+    auto: "Model support: allow tasteful lifestyle support only if it improves the ad finish while keeping the product dominant.",
+    hand: "Model support: if useful, include subtle hand-held or hand-interaction support that feels naturally photographed.",
+    half: "Model support: if useful, include a tasteful half-body lifestyle model while keeping the product as the hero.",
+    none: "Model support: do not include a visible person; keep the scene product-focused.",
+  };
+  return map[modelMode] || map.auto;
+}
+
+function getAngleDirective(payload) {
+  const angleMode = String(payload.angleMode || "auto");
+  const map = {
+    auto: "",
+    front: "Angle direction: prefer a confident front-facing hero angle with clear silhouette readability.",
+    angle45: "Angle direction: prefer a refined 45-degree hero angle that adds depth without losing recognizability.",
+    combo: "Angle direction: allow one main hero angle with subtle secondary-angle support only if it improves the commercial finish.",
+  };
+  return map[angleMode] || "";
+}
+
+function getBackgroundDirective(payload, promptText, blueprint) {
+  const backgroundMode = String(payload.backgroundMode || "auto");
+  const map = {
+    bathroom: "Scene direction: use a bright, clean, realistic lifestyle wash-area or bathroom environment only if it fits the product and intent.",
+    vanity: "Scene direction: use a polished tabletop or vanity-like lifestyle environment only if it fits the product and intent.",
+    hotel: "Scene direction: use a refined hospitality-style environment with premium restraint only if it fits the product and intent.",
+    plain: "Scene direction: keep the background clean, high-conversion, and minimally distracting.",
+  };
+  if (backgroundMode !== "auto") return map[backgroundMode] || blueprint.scene;
+  if (promptHasSignal(promptText, "scene")) return "";
+  return blueprint.scene;
+}
+
+function buildEditMasterPrompt(payload, coreDirection = "") {
+  const ownImages = getOwnImageSet(payload, 4);
+  const hasProductImage = ownImages.length > 0 || Boolean(payload.productImage);
+  const referenceImages = Array.isArray(payload.referenceImages)
+    ? payload.referenceImages.filter(Boolean)
+    : payload.referenceImage ? [payload.referenceImage] : [];
+  const productName = String(payload.productName || "").trim();
+  const normalizedCoreDirection = String(coreDirection || payload.userPrompt || "upgrade the product visual appeal into a premium marketplace hero image")
+    .replace(/\s+/g, " ")
+    .trim();
+  const promptContext = `${productName} ${normalizedCoreDirection}`.trim();
+  const blueprint = getCommercialBlueprint(inferCommercialCategory(promptContext, productName));
+  const ownImageCount = ownImages.length || Number(payload.productImageCount || 0) || (hasProductImage ? 1 : 0);
+  const clauses = [
+    `Core creative direction: ${normalizedCoreDirection}.`,
+    `Canvas aspect ratio: ${payload.aspectRatio || "1:1"}.`,
+    getStyleDirective(payload),
+    getModelDirective(payload),
+    getAngleDirective(payload),
+    getBackgroundDirective(payload, promptContext, blueprint),
+    !promptHasSignal(promptContext, "material")
+      ? (hasProductImage ? blueprint.materialLocked : blueprint.materialFree)
+      : (hasProductImage ? "Respect the observed product material truth from the uploaded source image; do not invent new decorative trims, hardware, or structural material changes." : ""),
+    !promptHasSignal(promptContext, "lighting") ? blueprint.lighting : "",
+    !promptHasSignal(promptContext, "camera") ? blueprint.camera : "",
+    blueprint.composition,
+    blueprint.support,
+    hasProductImage
+      ? `Use the uploaded product image${ownImageCount > 1 ? " set" : ""} as the proprietary product layer and preserve it with 100% fidelity${ownImageCount > 1 ? ", using all uploaded views as the same locked product identity reference" : ""}.`
+      : "",
+    hasProductImage
+      ? "Immutable identity: preserve the exact product category, silhouette, proportions, seams, hardware, trims, pocket layout, zipper path, printed details, and color-block relationships."
+      : "",
+    hasProductImage
+      ? "Adaptable fit is allowed only for believable perspective placement, contact shadows, reflected light, edge highlights, and natural model/body interaction if the scene requires it."
+      : "",
+    hasProductImage
+      ? "Forbidden fabrication: do not redesign, repaint, add new attachments, invent extra structure, replace the item with another product, or erase recognizable product details."
+      : "",
+    referenceImages.length
+      ? "If reference images are provided, absorb only their useful strengths at the principle level such as scene tone, composition rhythm, lifestyle mood, product scale, and commercial atmosphere; do not copy their brands, slogans, exact text, prices, or trademark layout."
+      : "",
+    "You may create clean generic headline areas, feature badge areas, promo ribbon areas, or info blocks only when they improve the ad finish, but do not copy any real brand names, slogans, logos, prices, or exact reference wording.",
+    blueprint.finish,
+    blueprint.exclusions,
+  ];
+  return clauses.filter(Boolean).join(" ");
+}
+
+function normalizeDirectPromptText(text) {
+  return String(text || "")
+    .replace(/```json|```/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function countCjkChars(text) {
+  const matches = String(text || "").match(/[\u3400-\u9fff]/g);
+  return matches ? matches.length : 0;
+}
+
+function looksLikeCompiledEnglishPrompt(text) {
+  const normalized = normalizeDirectPromptText(text);
+  if (normalized.length < 120) return false;
+  const alphaCount = (normalized.match(/[A-Za-z]/g) || []).length;
+  const cjkCount = countCjkChars(normalized);
+  if (!alphaCount) return false;
+  if (cjkCount > Math.max(6, Math.floor(alphaCount * 0.08))) return false;
+  return /(lighting|camera|composition|premium|product|commercial|hero|scene|material|shadow|background|retouching|marketplace)/i.test(normalized);
+}
+
+function buildEnglishFallbackDirection(payload) {
+  const rawName = String(payload.productName || "").trim();
+  const safeProductName = countCjkChars(rawName) ? "the target product" : (rawName || "the target product");
+  return `Create a premium e-commerce hero image for ${safeProductName} with refined commercial lighting, stronger material realism, clean composition, premium negative space, and elevated marketplace conversion appeal.`;
+}
+
+function buildReplacementMasterPrompt(payload, coreDirection = "") {
+  const productName = String(payload.productName || "").trim();
+  const templateIndex = Number(payload.templateIndex || 1);
+  const replacementIndex = Number(payload.replacementIndex || 2);
+  const normalizedCoreDirection = String(coreDirection || payload.userPrompt || "Replace the product in the template scene with the replacement product and keep everything else unchanged.")
+    .replace(/\s+/g, " ")
+    .trim();
+  const promptContext = `${productName} ${normalizedCoreDirection}`.trim();
+  const blueprint = getCommercialBlueprint(inferCommercialCategory(promptContext, productName));
+  return [
+    `Critical product replacement edit. Core user direction: ${normalizedCoreDirection}.`,
+    `Canvas aspect ratio: ${payload.aspectRatio || "1:1"}.`,
+    `The locked template scene comes from uploaded image ${templateIndex}. The replacement product source comes from uploaded image ${replacementIndex}.`,
+    "Keep the template scene visually intact: preserve the same person, hands, face, body pose, wardrobe, props, packaging, background, layout blocks, crop, perspective, lens feel, lighting direction, reflections, depth of field, and overall composition unless the user explicitly requests a change.",
+    `Treat the replacement product as the proprietary product layer${productName ? ` for ${productName}` : ""} and preserve its exact category, silhouette, proportions, seams, hardware, printed details, material zones, and recognizable structure.`,
+    blueprint.materialLocked,
+    "Replace only the single primary product object in the template scene. Do not replace secondary props, packaging, or supporting objects unless the user explicitly asks for that.",
+    "Match the replacement product to the original contact point, occlusion, support relationship, scale, perspective, cast shadow, reflected light, rim light, and environmental color so the final result looks naturally photographed in the existing scene rather than pasted.",
+    "Adaptable fit is allowed only where necessary to achieve believable body placement, hand grip, or scene contact while keeping the product identity fully intact.",
+    "Forbidden fabrication: do not redesign the product, invent new structure, remove recognizable details, alter labels, repaint materials, or change the scene's non-target elements.",
+    "Do not add copied branding, slogans, prices, watermarks, QR codes, random text, or unrelated accessories.",
+    blueprint.finish,
+    blueprint.exclusions,
+  ].filter(Boolean).join(" ");
+}
+
 function buildEditPlanInstruction(payload) {
+  const hasProductImage = Boolean(payload.productImage) || getOwnImageSet(payload, 4).length > 0;
+  const hasReferenceImages = Array.isArray(payload.referenceImages)
+    ? payload.referenceImages.some(Boolean)
+    : Boolean(payload.referenceImage);
   return [
     "# Role",
-    "你是顶级电商广告 Prompt 编译器，任务是把用户提示词、锁定产品图和灵感参考图，编译成一套可直接用于 gpt-image 的英文商业出图 Prompt。",
+    "You are a senior e-commerce prompt architect and commercial art director for GPT-Image. Your job is to turn the user's short request, locked product images, and optional inspiration references into one direct-to-use English commercial image prompt.",
     "",
     "# Context",
-    `用户原始需求：${payload.userPrompt || "未填写"}`,
-    `产品名称：${payload.productName || "未填写"}`,
-    `画幅比例：${payload.aspectRatio || "1:1"}`,
-    `优化风格：${payload.styleLabel || payload.styleMode || "clean"}`,
-    `模特/人物：${payload.modelLabel || payload.modelMode || "auto"}`,
-    `产品角度：${payload.angleLabel || payload.angleMode || "auto"}`,
-    `背景场景：${payload.backgroundLabel || payload.backgroundMode || "auto"}`,
+    `User request: ${payload.userPrompt || "not provided"}`,
+    `Product name: ${payload.productName || "not provided"}`,
+    `Aspect ratio: ${payload.aspectRatio || "1:1"}`,
+    `Style mode: ${payload.styleLabel || payload.styleMode || "clean"}`,
+    `Model mode: ${payload.modelLabel || payload.modelMode || "auto"}`,
+    `Angle mode: ${payload.angleLabel || payload.angleMode || "auto"}`,
+    `Background mode: ${payload.backgroundLabel || payload.backgroundMode || "auto"}`,
+    `Locked product image provided: ${hasProductImage ? "yes" : "no"}`,
+    `Inspiration reference provided: ${hasReferenceImages ? "yes" : "no"}`,
     "",
     "# Task",
-    "1. 如果存在锁定产品图，必须把它视为 proprietary product layer，最终生成图中的产品必须 100% 保持产品类型、轮廓、比例、拉链、肩带、口袋、缝线、五金、材质分区和颜色分区，不得变形，不得换品，不得重绘成另一款产品。",
-    "2. 如果存在灵感参考图，只允许吸收它们的有效优点，例如场景调性、构图节奏、视觉动线、生活方式气质、版式留白、信息区块节奏、商业转化氛围，但绝对不能复制品牌、Logo、口号、原文案、原价格、原版式细节。",
-    "3. 最终 generationPrompt 必须是单段完整纯英文，可以直接复制给 gpt-image 使用，不要输出中文 Prompt，不要输出多套版本。",
-    "4. generationPrompt 的目标不是普通产品图，而是 premium e-commerce hero image / commercial ad banner / high-end marketplace main image。",
-    "5. generationPrompt 必须比用户原始需求更导演化，明确写出：art direction、composition、model or lifestyle support、product dominance、lighting、material rendering、atmospheric depth、clean hierarchy、premium finish、negative exclusions。",
-    "6. 允许写 generic headline area、generic feature badge area、generic promo ribbon area、generic info block area，但不能复制参考图原始文字。",
-    "7. 如果用户提示词本身已经很强，不要削弱它；应在保留原始意图的基础上，把它编译得更像高完成度广告 Prompt。",
+    "1. First infer the product category and commercial use case from the user request and any uploaded product images.",
+    "2. Even if the user request is very short, automatically upgrade it into a high-end commercial prompt by filling in four layers: CMF / material and finish, Lighting / commercial light logic, Camera / lens and image quality, Scene / premium environment.",
+    "3. If the user already specified any of those layers, preserve the original intent and only make it more commercial, more precise, and more production-ready.",
+    "4. If a locked product image is provided, treat it as a proprietary product layer. The final image must preserve the exact category, silhouette, proportions, seams, hardware, trims, pocket layout, zipper path, printed details, material zones, and key recognizable identity. The product must not deform, drift, or be replaced by another product.",
+    "5. If a locked product image is provided, CMF instructions must faithfully enhance only what is visibly true in the uploaded product: lighting response, tactile realism, contrast, micro-shadow definition, edge clarity, and realistic material rendering. Do not invent new structures, trims, pockets, hardware, or brand markings.",
+    "6. If inspiration references are provided, absorb only their strengths at the principle level: scene tone, composition rhythm, product-to-frame ratio, lifestyle mood, negative space, information hierarchy, and commercial conversion atmosphere. Never copy their brands, logos, slogans, exact wording, prices, or trademark layout.",
+    "7. The final generationPrompt must be one complete direct-to-use English prompt for GPT-Image. No Chinese in generationPrompt. No markdown. No multiple versions.",
+    "8. The target output quality is premium e-commerce hero image / commercial advertising banner / high-end marketplace main image.",
+    "9. generationPrompt should read like a visual director's instruction set and should naturally cover: creative direction, art direction, composition, subject dominance, model or lifestyle support if relevant, lighting, material rendering, scene styling, atmospheric depth, camera quality, premium finish, and negative exclusions.",
+    "10. Generic headline areas, feature badge areas, promo ribbon areas, and information blocks are allowed only as blank or generic commercial layout placeholders. Never reproduce reference text or branding.",
+    "11. If the user wants the product placed on a model or integrated into a lifestyle scene, allow only believable perspective fit, contact logic, scale matching, shadow matching, and reflected-light matching while preserving the product identity.",
+    "12. Do not weaken a strong prompt. Elevate it.",
     "",
     "# Output",
-    "严格输出 JSON，不要 Markdown：",
+    "Output strict JSON only. No markdown.",
     "{",
-    '  "analysisNotes": ["中文简短总结参考图值得吸收的优点，2-4条"],',
-    '  "generationPrompt": "单段完整纯英文 Prompt，可直接用于 gpt-image；必须明确 proprietary product layer absolutely does not deform；必须体现 premium e-commerce ad finish、cinematic commercial polish、clean visual hierarchy、material contrast、atmospheric depth、sophisticated retouching feel；不得包含复制品牌和原文案的要求"',
+    '  "analysisNotes": ["2-4 short Chinese notes about the useful commercial strengths or prompt-upgrade decisions"],',
+    '  "generationPrompt": "one single-paragraph direct-to-use English prompt for GPT-Image"',
     "}",
   ].join("\n");
 }
@@ -843,12 +1409,13 @@ function buildReplacementPlanInstruction(payload) {
     payload.userPrompt || "Replace the product in image 1 with the product in image 2 and keep everything else unchanged.",
     "",
     "# Hard rules",
-    "1. Image 1 is the locked template scene. It defines the person, hands, pose, background, lighting, crop, perspective, composition, props, text blocks, packaging, and every non-target element.",
-    "2. Image 2 is the only replacement product source. Preserve its structure, silhouette, proportions, materials, printed details, hardware, seams, and key identity.",
-    "3. Replace only the primary product object in Image 1. Be specific about which object should be replaced based on the template scene.",
+    `1. Uploaded image ${payload.templateIndex || 1} is the locked template scene. It defines the person, hands, pose, background, lighting, crop, perspective, composition, props, text blocks, packaging, and every non-target element.`,
+    `2. Uploaded image ${payload.replacementIndex || 2} is the only replacement product source. Preserve its structure, silhouette, proportions, materials, printed details, hardware, seams, and key identity.`,
+    "3. Replace only the single primary product object inside the locked template scene. Be specific about which object should be replaced based on the template image.",
     "4. Keep all non-target scene elements visually unchanged. Do not redraw the person, background, props, typography layout, extra packaging, or secondary objects unless the user explicitly asked for that.",
     "5. The final prompt must tell GPT-Image to match the original contact point, occlusion, hand relationship, support point, perspective, lighting, cast shadow, reflected light, and scale so the replacement looks naturally photographed in the template scene.",
-    "6. Output only one direct-to-use English edit prompt. No markdown.",
+    "6. The final prompt must separate immutable identity, adaptable fit, and forbidden fabrication: the product identity must stay exact, scene fit may adapt only for believable contact/perspective, and no unrelated scene element may drift.",
+    "7. Output only one direct-to-use English edit prompt. No markdown.",
     "",
     "# Context",
     `Product name: ${payload.productName || "not provided"}`,
@@ -924,6 +1491,69 @@ function parseJsonFromText(text) {
   return JSON.parse(cleaned.slice(start, end + 1));
 }
 
+function parseJsonOrPromptPayload(text) {
+  try {
+    return parseJsonFromText(text);
+  } catch (error) {
+    const recovered = recoverPromptPayloadFromText(text);
+    if (recovered) return recovered;
+    throw error;
+  }
+}
+
+function recoverPromptPayloadFromText(text) {
+  const cleaned = String(text || "").replace(/```json|```/g, "").trim();
+  if (!cleaned) return null;
+
+  const generationPrompt = extractQuotedJsonField(cleaned, "generationPrompt");
+  const positivePrompt = extractQuotedJsonField(cleaned, "positivePrompt");
+  const negativePrompt = extractQuotedJsonField(cleaned, "negativePrompt");
+  if (generationPrompt || positivePrompt || negativePrompt) {
+    return {
+      generationPrompt: generationPrompt || "",
+      positivePrompt: positivePrompt || "",
+      negativePrompt: negativePrompt || "",
+    };
+  }
+
+  const promptBlock = cleaned.match(/Positive Prompt:\s*([\s\S]*?)(?:\n\s*Negative Prompt:\s*([\s\S]*))?$/i);
+  if (promptBlock) {
+    return {
+      positivePrompt: promptBlock[1]?.trim() || "",
+      negativePrompt: promptBlock[2]?.trim() || "",
+    };
+  }
+
+  const plainPrompt = cleaned.match(/(?:generationPrompt|final prompt|prompt)\s*[:：]\s*([\s\S]{80,})/i);
+  if (plainPrompt) {
+    return {
+      generationPrompt: plainPrompt[1].trim(),
+    };
+  }
+
+  return null;
+}
+
+function extractQuotedJsonField(text, fieldName) {
+  const pattern = new RegExp(`"${fieldName}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`, "i");
+  const match = String(text || "").match(pattern);
+  if (!match) return "";
+  return decodeEscapedJsonText(match[1]);
+}
+
+function decodeEscapedJsonText(value) {
+  const wrapped = `"${String(value || "").replace(/"/g, '\\"')}"`;
+  try {
+    return JSON.parse(wrapped).trim();
+  } catch (error) {
+    return String(value || "")
+      .replace(/\\n/g, "\n")
+      .replace(/\\"/g, "\"")
+      .replace(/\\\\/g, "\\")
+      .trim();
+  }
+}
+
 function normalizeAnalysisResult(raw, payload) {
   const creative = raw.creative || {};
   const scores = raw.scores || {};
@@ -960,18 +1590,13 @@ function normalizeAnalysisResult(raw, payload) {
 
 function normalizeEditPlan(raw, payload) {
   const analysisNotes = asStringArray(raw.analysisNotes).slice(0, 4);
-  const basePrompt = String(raw.generationPrompt || "").trim();
-
-  const fallbackPrompt = [
-    `Create a premium e-commerce hero image for ${payload.productName || "the product"} using the user's prompt as the main creative direction: ${payload.userPrompt || "upgrade the product visual appeal"}.`,
-    "If an uploaded product image is provided, treat it as the proprietary product layer and preserve it with 100% fidelity: absolutely do not deform, redraw, replace, simplify, or reinterpret the product.",
-    "Do not change the product structure, silhouette, proportions, zippers, straps, pockets, seams, hardware, material segmentation, or key identifying details.",
-    "Build a high-end commercial ad composition around the product with clear visual hierarchy, premium material rendering, atmospheric depth, refined lighting, and marketplace hero quality.",
-    "You may include generic ad layout zones such as a headline area, feature badge area, or promo ribbon area, but do not copy any brand names, slogans, logos, or exact text from references.",
-    "Avoid watermark, QR code, copied brand identity, random text, garbled letters, cheap collage feeling, and low-resolution artifacts.",
-  ].join("\n");
-
-  const prompt = basePrompt || fallbackPrompt;
+  const basePrompt = normalizeDirectPromptText(raw.generationPrompt || "");
+  const prompt = looksLikeCompiledEnglishPrompt(basePrompt)
+    ? basePrompt
+    : buildEditMasterPrompt(
+        payload,
+        buildEnglishFallbackDirection(payload),
+      );
 
   return {
     analysisNotes,
@@ -981,22 +1606,15 @@ function normalizeEditPlan(raw, payload) {
 
 function normalizeReplacementPlan(raw, payload) {
   const analysisNotes = asStringArray(raw.analysisNotes).slice(0, 4);
-  const basePrompt = String(raw.generationPrompt || "").trim();
-  const productName = String(payload.productName || "").trim();
-  const fallbackPrompt = [
-    "CRITICAL PRODUCT REPLACEMENT EDIT.",
-    "Image 1 is the locked template scene. Image 2 is the only replacement product source.",
-    `Follow the user instruction exactly: ${payload.userPrompt || "Replace the product in image 1 with the product in image 2 and keep everything else unchanged."}`,
-    productName ? `Target product name: ${productName}.` : "",
-    "Replace only the primary product object in the template scene. Keep the same person, hands, pose, clothing, props, text layout, packaging, background, camera angle, crop, perspective, lighting, shadows, reflections, depth of field, and overall composition.",
-    "Match the replacement product to the original scene contact point, occlusion, hand relationship, support point, scale, highlights, material response, reflected light, and cast shadow so it looks naturally photographed in the template scene.",
-    "Preserve the replacement product structure, silhouette, proportions, printed details, hardware, seams, and edges. Do not deform, redesign, simplify, or swap it for another product.",
-    "Do not add or remove unrelated elements. Do not redraw the model. Do not alter non-target props or the background.",
-  ].filter(Boolean).join("\n");
-
+  const basePrompt = normalizeDirectPromptText(raw.generationPrompt || "");
   return {
     analysisNotes,
-    prompt: basePrompt || fallbackPrompt,
+    prompt: looksLikeCompiledEnglishPrompt(basePrompt)
+      ? basePrompt
+      : buildReplacementMasterPrompt(
+          payload,
+          "Replace the target product in the locked template scene with the replacement product while keeping all non-target scene elements unchanged.",
+        ),
   };
 }
 
@@ -1612,6 +2230,59 @@ if (!isValidUsername(username)) {
       const user = requireAuth(req, res);
       if (!user) return;
       sendJson(res, 200, { user: publicUser(user) });
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/api/history") {
+      const user = requireAuth(req, res);
+      if (!user) return;
+      sendJson(res, 200, { histories: getUserHistoryPayload(user) });
+      return;
+    }
+
+    if (req.method === "POST" && pathname === "/api/history") {
+      const user = requireAuth(req, res);
+      if (!user) return;
+      const body = await readBody(req);
+      const payload = JSON.parse(body || "{}");
+      const mode = normalizeTaskMode(payload.mode);
+      const imageSrc = String(payload.src || "").trim();
+      const label = String(payload.label || MODULE_LABELS[mode] || "最新").trim();
+      if (!imageSrc) {
+        sendJson(res, 400, { error: "缺少历史记录图片" });
+        return;
+      }
+      persistHistoryImage(user, mode, imageSrc, label);
+      sendJson(res, 200, { histories: getUserHistoryPayload(user) });
+      return;
+    }
+
+    if (req.method === "DELETE" && pathname === "/api/history") {
+      const user = requireAuth(req, res);
+      if (!user) return;
+      const modeParam = String(url.searchParams.get("mode") || "").trim();
+      const mode = MODULE_KEYS.includes(modeParam) ? modeParam : "";
+      clearHistoryForUser(user, mode || undefined);
+      sendJson(res, 200, { histories: getUserHistoryPayload(user) });
+      return;
+    }
+
+    const historyAssetMatch = /^\/api\/history\/assets\/([^/]+)\/([^/]+)$/.exec(pathname);
+    if (req.method === "GET" && historyAssetMatch) {
+      const user = requireAuth(req, res);
+      if (!user) return;
+      const ownerId = decodeURIComponent(historyAssetMatch[1]);
+      const fileName = decodeURIComponent(historyAssetMatch[2]);
+      if (user.role !== "admin" && String(user.id) !== ownerId) {
+        sendJson(res, 403, { error: "Forbidden" });
+        return;
+      }
+      const filePath = resolveHistoryAssetPath(ownerId, fileName);
+      if (!filePath || !fs.existsSync(filePath)) {
+        sendJson(res, 404, { error: "Not found" });
+        return;
+      }
+      serveFile(res, filePath);
       return;
     }
 

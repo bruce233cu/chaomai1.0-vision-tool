@@ -1,6 +1,7 @@
 ﻿const state = {
   mode: "edit",
   own: null,
+  ownImages: [],
   competitors: [],
   editImages: [],
   ownMetrics: null,
@@ -103,9 +104,86 @@ const els = {
 };
 
 const ctx = els.canvas.getContext("2d");
+const MAX_MAIN_OWN_IMAGES = 4;
+
+function getOwnImageList() {
+  if (Array.isArray(state.ownImages) && state.ownImages.length) {
+    return state.ownImages;
+  }
+  return state.own ? [state.own] : [];
+}
+
+function getOwnImageSources() {
+  return getOwnImageList().map((item) => item?.src).filter(Boolean);
+}
+
+function syncOwnPrimary() {
+  state.own = getOwnImageList()[0] || null;
+}
 
 function setStatus(text) {
   els.statusPill.textContent = text;
+}
+
+function createEmptyHistories() {
+  return {
+    main: [],
+    edit: [],
+    develop: [],
+    clone: [],
+  };
+}
+
+function applyRemoteHistories(histories = {}) {
+  const next = createEmptyHistories();
+  Object.keys(next).forEach((mode) => {
+    next[mode] = Array.isArray(histories[mode]) ? histories[mode] : [];
+  });
+  state.histories = next;
+  renderHistory();
+}
+
+async function loadRemoteHistories() {
+  try {
+    const response = await fetch(getApiUrl("/api/history"));
+    const result = await readJsonResponse(response);
+    if (!response.ok) throw new Error(result.error || "历史记录读取失败");
+    applyRemoteHistories(result.histories || {});
+  } catch (error) {
+    console.warn("Failed to load remote histories:", error);
+  }
+}
+
+async function addHistoryImage(src, label = "最新", mode = state.mode) {
+  const history = getModeHistory(mode);
+  history.unshift({ src, label, time: Date.now(), mode });
+  state.histories[mode] = history.slice(0, 12);
+  renderHistory();
+
+  try {
+    const response = await fetch(getApiUrl("/api/history"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ src, label, mode }),
+    });
+    const result = await readJsonResponse(response);
+    if (!response.ok) throw new Error(result.error || "历史记录同步失败");
+    applyRemoteHistories(result.histories || {});
+  } catch (error) {
+    console.warn("Failed to persist history:", error);
+  }
+}
+
+async function clearRemoteHistory(mode = state.historyMode) {
+  const query = mode ? `?mode=${encodeURIComponent(mode)}` : "";
+  const response = await fetch(getApiUrl(`/api/history${query}`), {
+    method: "DELETE",
+  });
+  const result = await readJsonResponse(response);
+  if (!response.ok) {
+    throw new Error(result.error || "历史记录清理失败");
+  }
+  applyRemoteHistories(result.histories || {});
 }
 
 function setGenerationState(active, label = "生成中", current = 0, total = 1) {
@@ -138,6 +216,7 @@ function cancelGeneration() {
 function createModeSnapshot() {
   return {
     own: state.own,
+    ownImages: [...getOwnImageList()],
     competitors: [...state.competitors],
     editImages: [...state.editImages],
     editPrompt: els.editPrompt?.value || "",
@@ -160,6 +239,7 @@ function saveModeSnapshot(mode = state.mode) {
 function restoreModeSnapshot(mode) {
   const snapshot = state.modeData[mode] || {
     own: null,
+    ownImages: [],
     competitors: [],
     ownMetrics: null,
     competitorMetrics: [],
@@ -172,7 +252,8 @@ function restoreModeSnapshot(mode) {
     hasGenerated: false,
     downloadDisabled: true,
   };
-  state.own = snapshot.own;
+  state.ownImages = [...(snapshot.ownImages?.length ? snapshot.ownImages : snapshot.own ? [snapshot.own] : [])];
+  state.own = state.ownImages[0] || snapshot.own || null;
   state.competitors = [...snapshot.competitors];
   state.editImages = [...(snapshot.editImages || [])];
   if (els.editPrompt) els.editPrompt.value = snapshot.editPrompt || "";
@@ -246,9 +327,17 @@ function setMode(mode) {
 function setUploadLabels(mode) {
   const clone = mode === "clone";
   const develop = mode === "develop";
-  els.ownSectionTitle.textContent = clone ? "自己的产品" : develop ? "自己的产品图" : "自己的图片";
-  els.ownDropTitle.textContent = clone ? "上传替换产品图" : develop ? "上传当前产品图" : "上传当前图片";
-  els.ownDropHint.textContent = clone ? "只提供要替换进去的产品" : "支持拖拽 / 点击上传";
+  const main = mode === "main";
+  if (els.ownImage) {
+    els.ownImage.multiple = main;
+  }
+  els.ownSectionTitle.textContent = clone ? "自己的产品" : develop ? "自己的产品图" : main ? "当前产品图（多角度）" : "自己的图片";
+  els.ownDropTitle.textContent = clone ? "上传替换产品图" : develop ? "上传当前产品图" : main ? "上传当前产品多角度图" : "上传当前图片";
+  els.ownDropHint.textContent = clone
+    ? "只提供要替换进去的产品"
+    : main
+      ? `可上传最多 ${MAX_MAIN_OWN_IMAGES} 张同一产品不同角度图，系统会一起锁定外形；支持拖拽 / 点击上传`
+      : "支持拖拽 / 点击上传";
   els.competitorSectionTitle.textContent = clone ? "克隆参考图" : develop ? "竞品产品图" : "竞品 / 参考图";
   els.competitorDropTitle.textContent = clone ? "上传克隆参考图" : develop ? "上传竞品产品图" : "上传竞品 / 参考图";
   els.competitorDropHint.textContent = clone ? "参考图会锁定背景、人物、光影和构图" : develop ? "系统会分析产品共性优点" : "系统会分析共性优点";
@@ -380,9 +469,15 @@ function renderPreviews() {
     els.editPreview.innerHTML = "";
   }
 
-  if (state.own) {
-    els.ownPreview.appendChild(createThumb(state.own, state.ownMetrics, "自己的图片", clearOwnUpload));
-  }
+  const ownImages = getOwnImageList();
+  ownImages.forEach((item, index) => {
+    const label = state.mode === "main"
+      ? index === 0
+        ? "当前产品图（主视角）"
+        : `当前产品图（补充角度 ${index + 1}）`
+      : "自己的图片";
+    els.ownPreview.appendChild(createThumb(item, index === 0 ? state.ownMetrics : null, label, () => removeOwnImage(index)));
+  });
 
   state.competitors.forEach((item, index) => {
     els.competitorPreview.appendChild(createThumb(item, state.competitorMetrics[index], state.mode === "clone" ? "克隆参考图" : "参考图", () => removeCompetitorImage(index)));
@@ -392,7 +487,8 @@ function renderPreviews() {
     els.editPreview.appendChild(createThumb(item, null, "提示词参考图", () => removeEditImage(index)));
   });
 
-  els.ownDrop.classList.toggle("has-file", Boolean(state.own));
+  els.ownPreview.classList.toggle("single", ownImages.length <= 1);
+  els.ownDrop.classList.toggle("has-file", ownImages.length > 0);
   els.competitorDrop.classList.toggle("has-file", state.competitors.length > 0);
   if (els.editDrop) els.editDrop.classList.toggle("has-file", state.editImages.length > 0);
 }
@@ -822,7 +918,120 @@ function buildPromptWithControls(prompt, title = "用户选择的生成控制，
   ].join("\n");
 }
 
-function buildEditDirectorPrompt(userPrompt, { hasOwnImage = false } = {}) {
+function inferCommercialCategory(promptText = "", productName = "") {
+  const text = `${productName} ${promptText}`.toLowerCase();
+  if (/(吹风机|电吹风|hair\s*dryer|dryer|styler|straightener|curling|卷发棒|夹板)/i.test(text)) return "haircare";
+  if (/(背包|双肩包|书包|包包|backpack|bag|tote|luggage|travel bag|satchel)/i.test(text)) return "bag";
+  if (/(水杯|保温杯|杯子|马克杯|bottle|flask|tumbler|mug|cup)/i.test(text)) return "drinkware";
+  if (/(口红|粉底|护肤|面霜|精华|香水|彩妆|cosmetic|skincare|makeup|serum|cream|perfume|lipstick)/i.test(text)) return "beauty";
+  if (/(礼盒|月饼|糕点|食品|零食|gift box|hamper|snack|pastry|festival box|mooncake)/i.test(text)) return "gift";
+  if (/(耳机|音箱|手机壳|数据线|充电器|数码|headphone|earbud|speaker|phone case|charger|cable)/i.test(text)) return "electronics";
+  if (/(首饰|项链|手表|戒指|耳环|jewelry|necklace|watch|ring|earring)/i.test(text)) return "jewelry";
+  return "generic";
+}
+
+function promptHasSignal(promptText, dimension) {
+  const text = String(promptText || "");
+  const map = {
+    material: /(材质|金属|哑光|磨砂|皮革|织物|尼龙|玻璃|陶瓷|木纹|matte|glossy|metal|fabric|nylon|leather|glass|ceramic|woodgrain|brushed)/i,
+    lighting: /(光|光影|逆光|柔光|阴影|侧光|窗光|日光|打光|lighting|sunlight|shadow|rim light|softbox|window light|backlight|warm light)/i,
+    camera: /(镜头|景深|虚化|特写|构图|广角|85mm|50mm|微距|bokeh|depth of field|close-up|macro|cropped|telephoto)/i,
+    scene: /(背景|场景|桌面|台面|窗边|浴室|海边|户外|室内|卧室|客厅|厨房|梳妆台|background|scene|interior|bathroom|vanity|tabletop|outdoor|coastal|kitchen|bedroom|studio)/i,
+  };
+  return map[dimension]?.test(text) || false;
+}
+
+function getCommercialBlueprint(category) {
+  const shared = {
+    finish: "Final finish: premium e-commerce hero quality, clean visual hierarchy, believable material separation, atmospheric depth, refined commercial retouching, and strong click-through appeal.",
+    exclusions: "Avoid copied brand names, logos, slogans, prices, random text, watermark, QR code, cheap collage feeling, low-resolution artifacts, and blurry hero-subject edges.",
+  };
+  const map = {
+    haircare: {
+      materialFree: "Material direction: refined matte or satin-touch body finish, fingerprint-resistant surface feel, precise parting lines, subtle premium trim control, and clean high-end appliance detailing.",
+      materialLocked: "Read the uploaded product's observed material truthfully: preserve the exact body finish, existing trim logic, buttons, vents, nozzle form, seams, and surface texture; only elevate how those details are lit and rendered.",
+      lighting: "Lighting direction: studio-grade softbox key light blended with gentle window-side daylight, soft warm highlights, controlled rim light around the silhouette, and flattering beauty-ad tonal balance.",
+      camera: "Camera direction: premium 85mm commercial product/beauty lens look, shallow depth of field, clean bokeh falloff, crisp hero focus, and ultra-clear ad-grade sharpness.",
+      scene: "Scene direction: a refined warm home-care environment such as a modern vanity, airy cream-toned wash area, or softly sunlit tabletop with calm premium styling.",
+      composition: "Composition direction: keep the product or the product-with-model relationship as the first visual focal point, with generous breathable negative space and a high-conversion ad layout rhythm.",
+      support: "If a lifestyle model is used, keep the pose elegant and supportive, with natural hand interaction and believable beauty-ad posture rather than theatrical fashion posing.",
+    },
+    bag: {
+      materialFree: "Material direction: structured woven fabric or coated textile feel, crisp seam definition, subtle micro-wrinkles, restrained hardware sheen, and premium everyday durability cues.",
+      materialLocked: "Read the uploaded bag exactly as photographed: preserve its true fabric family, seams, pockets, zipper path, strap thickness, hardware placement, labels, printed details, and color-block structure; only improve lighting, edge clarity, and material depth.",
+      lighting: "Lighting direction: bright commercial daylight with soft directional fill, believable side sunlight, delicate rim separation, realistic contact shadows, and clean atmospheric depth.",
+      camera: "Camera direction: premium 85mm marketplace ad lens look with shallow background blur, crisp edge definition on the bag, realistic depth compression, and polished hero-subject sharpness.",
+      scene: "Scene direction: a clean outdoor-travel or commute-lifestyle environment such as a coastal path, modern transit setting, or bright airy travel platform without visual clutter.",
+      composition: "Composition direction: make the bag the dominant hero subject with strong silhouette readability, clear scale hierarchy, and an ad-friendly balance between product, background depth, and optional info layout zones.",
+      support: "If a model is used, the bag may be naturally worn or held, but the product must remain the commercial hero rather than becoming a background accessory.",
+    },
+    drinkware: {
+      materialFree: "Material direction: premium metal, coated ceramic, or clean engineered plastic rendering with restrained specular control, refined edge highlights, and premium tactile finish.",
+      materialLocked: "Read the uploaded drinkware exactly as it appears: preserve the true body proportions, lid structure, handle logic, spout details, surface finish, material zones, and printed elements; only elevate realism through lighting and micro-contrast.",
+      lighting: "Lighting direction: soft premium tabletop light with controlled highlights, realistic reflections, gentle side illumination, and polished catalog-grade contrast.",
+      camera: "Camera direction: clean 85mm or short-tele commercial still-life lens look, shallow depth of field, crisp focal plane on the hero product, and extremely clean product photography sharpness.",
+      scene: "Scene direction: a refined tabletop, breakfast nook, or calm hospitality-inspired lifestyle setting with soft premium restraint.",
+      composition: "Composition direction: keep the product centered in a calm, premium still-life composition with strong material readability and elegant negative space.",
+      support: "Use supporting props only if they feel restrained, relevant, and secondary to the product.",
+    },
+    beauty: {
+      materialFree: "Material direction: luxe beauty-pack finish, refined matte or glossy surface control, crisp label area handling, subtle metallic accents, and delicate tactile realism.",
+      materialLocked: "Read the uploaded beauty product faithfully: preserve its bottle, cap, pump, label area, finish, proportions, and decorative details exactly, while only upgrading material realism and surface lighting.",
+      lighting: "Lighting direction: soft beauty-campaign illumination with diffused glow, graceful highlight rolloff, fine edge light, and elegant skin-or-surface flattering warmth.",
+      camera: "Camera direction: premium beauty still-life photography, 85mm commercial lens look, shallow depth of field, subtle bokeh, and pristine high-resolution finish.",
+      scene: "Scene direction: a refined vanity, marble or cream-toned tabletop, softly sunlit beauty corner, or elegant editorial home-care environment.",
+      composition: "Composition direction: keep the product dominant while surrounding it with beauty-campaign atmosphere, clean negative space, and polished conversion-ready hierarchy.",
+      support: "If a model or hand is present, it should feel elegant, restrained, and naturally supportive of the hero product.",
+    },
+    gift: {
+      materialFree: "Material direction: premium paperboard, embossed patterning, fabric or ribbon accents, lacquer-like color richness, and ceremonial packaging craftsmanship.",
+      materialLocked: "Read the uploaded gift packaging exactly: preserve the box structure, handle logic, embossed or printed pattern zones, trim, tassels, ribbons, and material layering while only elevating depth, shadow, and surface richness.",
+      lighting: "Lighting direction: luxurious directional studio light with controlled festive warmth, dimensional highlight placement, soft shadow transitions, and premium ceremonial atmosphere.",
+      camera: "Camera direction: high-end commercial packaging photography with crisp hero focus, elegant depth separation, and polished premium advertising sharpness.",
+      scene: "Scene direction: a refined festive display environment with tasteful wood, fabric, lacquer, or ceremonial tabletop cues, while keeping the packaging dominant.",
+      composition: "Composition direction: build a premium presentation with strong frontal readability, rich but controlled atmosphere, and clear premium gift-value storytelling.",
+      support: "Hands or wardrobe support may appear if needed, but they must serve the packaging hero and preserve premium ceremony cues.",
+    },
+    electronics: {
+      materialFree: "Material direction: refined engineered surfaces, anti-smudge finish, precise seam control, subtle metallic or glass accents, and premium consumer-tech detailing.",
+      materialLocked: "Read the uploaded device faithfully: preserve its exact housing geometry, buttons, ports, trims, textures, and material segmentation while only improving light behavior and tactile realism.",
+      lighting: "Lighting direction: premium commercial studio lighting with controlled contrast, soft reflections, subtle rim separation, and elegant high-tech polish without harsh glare.",
+      camera: "Camera direction: premium commercial product-photography lens look, shallow depth of field when useful, tack-sharp device edges, and crisp tech-ad clarity.",
+      scene: "Scene direction: a restrained modern environment such as a clean desk, minimal lifestyle interior, or softly lit premium tech setup with low clutter.",
+      composition: "Composition direction: emphasize clarity, precision, and premium object presence with clean geometry and strong visual hierarchy.",
+      support: "Lifestyle support should feel minimal, modern, and secondary to the product's form and usability cues.",
+    },
+    jewelry: {
+      materialFree: "Material direction: high-fidelity precious-metal rendering, elegant highlight control, refined gemstone sparkle, and luxurious surface polish.",
+      materialLocked: "Read the uploaded jewelry faithfully: preserve its exact form, setting, proportions, clasp or band logic, surface detailing, and stone placement while only enhancing shine, depth, and realism.",
+      lighting: "Lighting direction: elegant luxury-product lighting with pinpoint sparkle control, soft fill, premium edge highlights, and refined depth.",
+      camera: "Camera direction: macro-luxury commercial lens feel, shallow depth of field, crisp subject plane, and ultra-clean high-end advertising sharpness.",
+      scene: "Scene direction: a restrained premium jewelry environment such as velvet, stone, or soft editorial tabletop styling with elegant negative space.",
+      composition: "Composition direction: keep the jewelry visually precious, isolated, and dominant, with luxurious material contrast and uncluttered sophistication.",
+      support: "If hands or model cues appear, they must remain understated and premium.",
+    },
+    generic: {
+      materialFree: "Material direction: premium matte-to-satin finish control, clear edge definition, refined tactile realism, and believable commercial-grade surface treatment.",
+      materialLocked: "Read the uploaded product faithfully from the source image: preserve its true structure, materials, edges, seams, prints, hardware, and finish while only upgrading lighting response and realism.",
+      lighting: "Lighting direction: studio-grade soft directional lighting with refined fill, subtle rim separation, believable highlights, controlled shadows, and premium commercial depth.",
+      camera: "Camera direction: premium 85mm commercial hero-shot lens feel, shallow depth of field where useful, crisp focal priority on the hero product, and ultra-clean ad-grade clarity.",
+      scene: "Scene direction: a tasteful premium lifestyle or tabletop setting that fits the product naturally, with clean negative space and restrained styling.",
+      composition: "Composition direction: maintain strong hero-subject dominance, balanced breathing room, polished marketplace hierarchy, and believable commercial staging.",
+      support: "Lifestyle support is allowed only when it strengthens the product story without stealing attention from the hero subject.",
+    },
+  };
+  return {
+    ...shared,
+    ...(map[category] || map.generic),
+  };
+}
+
+function buildEditDirectorPrompt(userPrompt, {
+  hasOwnImage = false,
+  ownImageCount = hasOwnImage ? 1 : 0,
+  referenceCount = 0,
+  productName: optionProductName = "",
+} = {}) {
   const styleMap = {
     clean: "Aim for a clean, high-click marketplace hero image with polished simplicity.",
     premium: "Aim for a premium, refined, upscale marketplace hero image with elevated material feel.",
@@ -848,33 +1057,92 @@ function buildEditDirectorPrompt(userPrompt, { hasOwnImage = false } = {}) {
     hotel: "Use a refined hospitality-style environment only if it fits the product and prompt.",
     plain: "Keep the background clean and high-conversion with minimal distraction.",
   };
+  const productName = String(optionProductName || els.productName?.value || "").trim();
+  const lockedOwnImageCount = Number(ownImageCount || (hasOwnImage ? 1 : 0));
+  const referenceImageCount = Number(referenceCount || 0);
+  const promptText = `${productName} ${userPrompt}`.trim();
+  const blueprint = getCommercialBlueprint(inferCommercialCategory(promptText, productName));
+  const explicitScene = promptHasSignal(promptText, "scene");
+  const explicitLighting = promptHasSignal(promptText, "lighting");
+  const explicitCamera = promptHasSignal(promptText, "camera");
+  const explicitMaterial = promptHasSignal(promptText, "material");
+  const backgroundDirective = backgroundMap[els.backgroundMode.value] || "";
 
   return [
-    userPrompt,
+    `Core user direction: ${userPrompt}`,
     `Canvas aspect ratio: ${state.aspectRatio}.`,
     styleMap[els.styleMode.value] || styleMap.clean,
     modelMap[els.modelMode.value] || modelMap.auto,
     angleMap[els.angleMode.value] || "",
-    backgroundMap[els.backgroundMode.value] || "",
+    backgroundDirective || (!explicitScene ? blueprint.scene : ""),
+    !explicitMaterial ? (hasOwnImage ? blueprint.materialLocked : blueprint.materialFree) : (hasOwnImage ? "Respect the observed product material truth from the uploaded source image; do not invent new decorative trims, hardware, or structural material changes." : ""),
+    !explicitLighting ? blueprint.lighting : "",
+    !explicitCamera ? blueprint.camera : "",
+    blueprint.composition,
+    blueprint.support,
     hasOwnImage
-      ? "Use the uploaded product image as the proprietary product layer and preserve it with 100% fidelity."
+      ? `Use the uploaded product image${lockedOwnImageCount > 1 ? " set" : ""} as the proprietary product layer and preserve it with 100% fidelity${lockedOwnImageCount > 1 ? ", using all uploaded views as the same locked product identity reference" : ""}.`
       : "",
     hasOwnImage
-      ? "The proprietary product layer absolutely must not deform, must not be redrawn, and must not change structure, silhouette, proportions, zippers, straps, pockets, seams, hardware, material segmentation, or key identifying details."
+      ? "Immutable identity: preserve the exact product category, silhouette, proportions, seams, hardware, trims, pocket layout, zipper path, printed details, and color-block relationships."
       : "",
-    "Turn the result into a premium e-commerce hero image / commercial ad banner / high-end marketplace main image with strong visual hierarchy, premium lighting, material contrast, atmospheric depth, and sophisticated retouching feel.",
-    "You may use clean generic headline area, feature badge area, promo ribbon area, or info block area when they improve the ad finish, but do not copy real brand names, logos, slogans, prices, or exact reference text.",
-    "Avoid watermark, QR code, random text, garbled letters, trademark infringement, cheap collage feeling, low-resolution artifacts, and blurry product edges.",
+    hasOwnImage
+      ? "Adaptable fit is allowed only for believable perspective placement, contact shadows, reflected light, edge highlights, and natural model/body interaction if the scene requires it."
+      : "",
+    hasOwnImage
+      ? "Forbidden fabrication: do not redesign, repaint, add new attachments, invent extra structure, replace the item with another product, or erase recognizable product details."
+      : "",
+    referenceImageCount > 0
+      ? "If uploaded reference images exist, absorb only their useful strengths at the principle level such as scene tone, layout rhythm, product scale, and ad atmosphere; do not copy their brands, slogans, exact text, or trademark layout."
+      : "",
+    "You may use clean generic headline area, feature badge area, promo ribbon area, or info block area only when they improve the ad finish, but do not copy real brand names, logos, slogans, prices, or exact reference text.",
+    blueprint.finish,
+    blueprint.exclusions,
   ].filter(Boolean).join("\n");
 }
 
-function isTwoImageReplacementPrompt(prompt, imageCount) {
+function parseReplacementTaskRouting(prompt, imageCount) {
   if (imageCount < 2) return false;
-  const text = String(prompt || "").toLowerCase();
+  const text = String(prompt || "");
+  const lowered = text.toLowerCase();
   const hasNumberedReference = /(图1|图2|image\s*1|image\s*2)/i.test(text);
-  const hasReplaceIntent = /(替换|replace|swap|换成|替成)/i.test(text);
+  const hasReplaceIntent = /(替换|replace|swap|换成|替成|替换为)/i.test(text);
   const hasKeepOthers = /(其他元素不变|其余元素不变|其他不变|others? unchanged|keep .* unchanged|everything else unchanged)/i.test(text);
-  return hasNumberedReference && hasReplaceIntent && hasKeepOthers;
+  if (!(hasNumberedReference && hasReplaceIntent && hasKeepOthers)) return null;
+
+  let templateIndex = 1;
+  let replacementIndex = 2;
+  const keepImage2 = /(图\s*2[^。\n，；]{0,24}(其他元素不变|其余元素不变|场景不变|其余保持不变)|keep\s+image\s*2.*unchanged|image\s*2.*everything else unchanged)/i.test(lowered);
+  const keepImage1 = /(图\s*1[^。\n，；]{0,24}(其他元素不变|其余元素不变|场景不变|其余保持不变)|keep\s+image\s*1.*unchanged|image\s*1.*everything else unchanged)/i.test(lowered);
+  if (keepImage2) templateIndex = 2;
+  if (keepImage1) templateIndex = 1;
+
+  const directTargetSource = text.match(/图\s*([12])[^。\n]{0,28}(?:产品|主体|内容)?[^。\n]{0,12}(?:替换成|换成|替成)\s*图\s*([12])/i)
+    || text.match(/image\s*([12])[^.\n]{0,40}(?:replace(?:d)?\s+with|swap(?:ped)?\s+with)\s*image\s*([12])/i);
+  const sourceTarget = text.match(/用\s*图\s*([12])[^。\n]{0,28}(?:产品|主体|内容)?[^。\n]{0,12}(?:替换|换掉)\s*图\s*([12])/i)
+    || text.match(/use\s+image\s*([12])[^.\n]{0,40}(?:to\s+replace|replace)\s+image\s*([12])/i);
+
+  if (directTargetSource && directTargetSource[1] !== directTargetSource[2]) {
+    templateIndex = Number(directTargetSource[1]);
+    replacementIndex = Number(directTargetSource[2]);
+  } else if (sourceTarget && sourceTarget[1] !== sourceTarget[2]) {
+    replacementIndex = Number(sourceTarget[1]);
+    templateIndex = Number(sourceTarget[2]);
+  } else {
+    replacementIndex = templateIndex === 1 ? 2 : 1;
+  }
+
+  if (templateIndex === replacementIndex) replacementIndex = templateIndex === 1 ? 2 : 1;
+  return {
+    templateIndex,
+    replacementIndex,
+    templateZeroIndex: templateIndex - 1,
+    replacementZeroIndex: replacementIndex - 1,
+  };
+}
+
+function isTwoImageReplacementPrompt(prompt, imageCount) {
+  return Boolean(parseReplacementTaskRouting(prompt, imageCount));
 }
 
 function normalizeReplacementProductName(value) {
@@ -1403,6 +1671,7 @@ async function analyze() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         ownImage: state.own.src,
+        ownImages: getOwnImageSources(),
         competitorImages: state.competitors.map((item) => item.src),
         productName: els.productName.value.trim(),
         keywords: els.keywords.value.trim(),
@@ -1469,20 +1738,13 @@ function mergeMetricFallback(analysis) {
     positivePrompt: analysis.positivePrompt || fallback.positivePrompt,
     negativePrompt: analysis.negativePrompt || fallback.negativePrompt,
     promptVariants: analysis.promptVariants?.length ? analysis.promptVariants : [],
-    prompt: analysis.prompt || buildImagePrompt(fallback),
+    prompt: analysis.prompt || analysis.rawPrompt || (analysis.positivePrompt ? buildImagePrompt(analysis) : buildImagePrompt(fallback)),
   };
 }
 
 function getModeHistory(mode = state.historyMode || state.mode) {
   if (!state.histories[mode]) state.histories[mode] = [];
   return state.histories[mode];
-}
-
-function addHistoryImage(src, label = "最新", mode = state.mode) {
-  const history = getModeHistory(mode);
-  history.unshift({ src, label, time: Date.now(), mode });
-  state.histories[mode] = history.slice(0, 12);
-  renderHistory();
 }
 
 function updateHistoryTabs() {
@@ -1573,6 +1835,7 @@ async function generateRealImage() {
         body: JSON.stringify({
           prompt: promptToSend,
           ownImage: state.own.src,
+          ownImages: getOwnImageSources(),
           productName: els.productName.value.trim(),
           keywords: els.keywords.value.trim(),
           styleMode: els.styleMode.value,
@@ -1591,7 +1854,7 @@ async function generateRealImage() {
       }
 
       els.generatedImage.src = result.image;
-      addHistoryImage(result.image, variants[index].title || `方案 ${index + 1}`);
+      await addHistoryImage(result.image, variants[index].title || `方案 ${index + 1}`);
       updateGenerationProgress(progressLabel, index + 1, variants.length);
     }
 
@@ -1629,19 +1892,26 @@ async function generateEditImages() {
   try {
     await checkApiServer();
     const uploadedImages = state.editImages.slice(0, 8);
-    const isReplacementTask = isTwoImageReplacementPrompt(prompt, uploadedImages.length);
+    const replacementTask = parseReplacementTaskRouting(prompt, uploadedImages.length);
+    const isReplacementTask = Boolean(replacementTask);
     const productImage = uploadedImages[0] || null;
     const inspirationImages = uploadedImages.slice(1);
     const hasProductImage = Boolean(productImage);
     const hasInspiration = inspirationImages.length > 0;
-    let compiledPrompt = buildEditDirectorPrompt(prompt, { hasOwnImage: hasProductImage });
+    let compiledPrompt = buildEditDirectorPrompt(prompt, {
+      hasOwnImage: hasProductImage,
+      ownImageCount: hasProductImage ? 1 : 0,
+      referenceCount: inspirationImages.length,
+      productName: els.productName.value.trim(),
+    });
     let generateOwnImage = productImage?.src || "";
     let generateReferenceImages = [];
 
     if (isReplacementTask) {
-      const templateImage = uploadedImages[1];
-      if (!templateImage) {
-        throw new Error("双图替换任务至少需要 2 张图：图1为替换产品，图2为模板场景。");
+      const templateImage = uploadedImages[replacementTask.templateZeroIndex];
+      const replacementImage = uploadedImages[replacementTask.replacementZeroIndex];
+      if (!templateImage || !replacementImage) {
+        throw new Error("双图替换任务至少需要 2 张图，系统会按提示词自动判断哪张是模板场景、哪张是替换产品。");
       }
       const productName = normalizeReplacementProductName(els.productName.value);
       setGenerationState(true, "双图替换", 0, 2);
@@ -1652,11 +1922,13 @@ async function generateEditImages() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           templateImage: templateImage.src,
-          replacementImage: productImage?.src || "",
+          replacementImage: replacementImage.src,
           userPrompt: prompt,
           productName,
           keywords: els.keywords.value.trim(),
           aspectRatio: state.aspectRatio,
+          templateIndex: replacementTask.templateIndex,
+          replacementIndex: replacementTask.replacementIndex,
           taskMode: "edit",
         }),
         signal: state.abortController.signal,
@@ -1665,13 +1937,13 @@ async function generateEditImages() {
       if (!planResponse.ok) throw new Error(planResult.error || "双图替换提示词编译失败");
       compiledPrompt = planResult.prompt || buildEditReplacementPrompt(prompt, productName, (planResult.analysisNotes || []).join("; "));
       generateOwnImage = templateImage.src;
-      generateReferenceImages = [productImage.src];
+      generateReferenceImages = [replacementImage.src];
     }
 
-    if (!isReplacementTask && (hasProductImage || hasInspiration)) {
+    if (!isReplacementTask) {
       setGenerationState(true, "提示词做图", 0, 2);
-      setStatus("正在编译广告提示词");
-      updateGenerationProgress("提示词编译", 1, 2);
+      setStatus(hasProductImage || hasInspiration ? "正在编译广告提示词" : "正在扩写商业提示词");
+      updateGenerationProgress(hasProductImage || hasInspiration ? "提示词编译" : "提示词扩写", 1, 2);
       const planResponse = await fetch(getApiUrl("/api/edit-plan"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1689,6 +1961,8 @@ async function generateEditImages() {
           backgroundMode: els.backgroundMode.value,
           backgroundLabel: getSelectText(els.backgroundMode),
           aspectRatio: state.aspectRatio,
+          productImageCount: hasProductImage ? 1 : 0,
+          referenceCount: inspirationImages.length,
           taskMode: "edit",
         }),
         signal: state.abortController.signal,
@@ -1701,7 +1975,7 @@ async function generateEditImages() {
     const finalPrompt = compiledPrompt;
     const totalSteps = isReplacementTask
       ? 2
-      : (!isReplacementTask && (hasProductImage || hasInspiration) ? 2 : 1);
+      : 2;
     const currentStep = totalSteps > 1 ? 1 : 0;
     setGenerationState(true, "提示词做图", currentStep, totalSteps);
     setStatus(`提示词做图 ${totalSteps > 1 ? "2/2" : "1/1"}`);
@@ -1725,14 +1999,14 @@ async function generateEditImages() {
           ? "two-image-replacement"
           : hasProductImage
             ? (hasInspiration ? "product-lock-compiled" : "product-lock-director")
-            : "text-to-image-director",
+            : "text-to-image-compiled",
       }),
       signal: state.abortController.signal,
     });
     const result = await readJsonResponse(response);
     if (!response.ok) throw new Error(result.error || "生成失败");
     els.generatedImage.src = result.image;
-    addHistoryImage(result.image, "提示词做图");
+    await addHistoryImage(result.image, "提示词做图");
     updateGenerationProgress("提示词做图", totalSteps, totalSteps);
     els.canvasWrap.classList.add("has-output", "has-generated");
     els.downloadBtn.disabled = false;
@@ -1799,7 +2073,7 @@ async function generateCloneImage() {
     const result = await readJsonResponse(response);
     if (!response.ok) throw new Error(result.error || "克隆失败");
     els.generatedImage.src = result.image;
-    addHistoryImage(result.image, "克隆详情");
+    await addHistoryImage(result.image, "克隆详情");
     els.canvasWrap.classList.add("has-output", "has-generated");
     els.downloadBtn.disabled = false;
     saveModeSnapshot("clone");
@@ -1857,13 +2131,12 @@ async function readJsonResponse(response) {
 
 function resetAll() {
   state.own = null;
+  state.ownImages = [];
   state.competitors = [];
   state.editImages = [];
   state.ownMetrics = null;
   state.competitorMetrics = [];
   state.lastAnalysis = null;
-  state.histories = { main: [], edit: [], develop: [], clone: [] };
-  state.history = [];
   state.activePromptIndex = 0;
   els.ownImage.value = "";
   els.competitorImages.value = "";
@@ -1880,7 +2153,6 @@ function resetAll() {
   els.canvasWrap.classList.remove("has-output");
   els.canvasWrap.classList.remove("has-generated");
   els.generatedImage.removeAttribute("src");
-  renderHistory();
   els.downloadBtn.disabled = true;
   els.copyPromptBtn.disabled = true;
   els.generateBtn.disabled = true;
@@ -1889,6 +2161,7 @@ function resetAll() {
 
 function clearOwnUpload() {
   state.own = null;
+  state.ownImages = [];
   state.ownMetrics = null;
   els.ownImage.value = "";
   els.ownDrop.classList.remove("has-file");
@@ -1897,7 +2170,7 @@ function clearOwnUpload() {
     els.generateBtn.disabled = true;
   }
   saveModeSnapshot();
-  setStatus("已清空自己的图片");
+  setStatus(state.mode === "main" ? "已清空产品角度图" : "已清空自己的图片");
 }
 
 function clearCompetitorUpload() {
@@ -1938,6 +2211,24 @@ function removeCompetitorImage(index) {
   setStatus("已移除参考图");
 }
 
+function removeOwnImage(index) {
+  const ownImages = getOwnImageList();
+  if (index < 0 || index >= ownImages.length) return;
+  ownImages.splice(index, 1);
+  state.ownImages = ownImages;
+  syncOwnPrimary();
+  state.ownMetrics = null;
+  if (!state.ownImages.length) {
+    els.ownImage.value = "";
+  }
+  renderPreviews();
+  if (state.mode === "clone") {
+    els.generateBtn.disabled = true;
+  }
+  saveModeSnapshot();
+  setStatus(state.mode === "main" ? "已移除一张产品角度图" : "已移除自己的图片");
+}
+
 function removeEditImage(index) {
   state.editImages.splice(index, 1);
   if (els.editDrop) els.editDrop.classList.toggle("has-file", state.editImages.length > 0);
@@ -1969,18 +2260,27 @@ function clearCurrentMode() {
   saveModeSnapshot();
 }
 
-async function handleOwnFiles(files) {
-  const [image] = await readFiles(files, 1);
-  if (!image) return;
-  state.own = image;
+async function handleOwnFiles(files, append = false) {
+  const limit = state.mode === "main" ? MAX_MAIN_OWN_IMAGES : 1;
+  const images = await readFiles(files, limit);
+  if (!images.length) return;
+  state.ownImages = append && state.mode === "main"
+    ? [...getOwnImageList(), ...images].slice(0, MAX_MAIN_OWN_IMAGES)
+    : images.slice(0, limit);
+  syncOwnPrimary();
   state.ownMetrics = null;
+  if (state.mode === "main") {
+    els.ownImage.value = "";
+  }
   els.ownDrop.classList.add("has-file");
   renderPreviews();
   if (state.mode === "clone") {
     els.generateBtn.disabled = !(state.own && state.competitors.length);
   }
   saveModeSnapshot();
-  setStatus("已上传主图");
+  setStatus(state.mode === "main"
+    ? `已上传 ${state.ownImages.length} 张产品角度图`
+    : "已上传主图");
 }
 
 async function handleCompetitorFiles(files, append = false) {
@@ -2006,9 +2306,9 @@ async function handleEditFiles(files, append = false) {
   els.generateBtn.disabled = state.mode === "edit" && !els.editPrompt.value.trim();
   saveModeSnapshot("edit");
   setStatus(state.editImages.length > 1
-    ? `已上传 ${state.editImages.length} 张图片（首张为产品图）`
+    ? `已上传 ${state.editImages.length} 张图片（默认首张为锁定产品图，也可按提示词触发双图替换）`
     : state.editImages.length === 1
-      ? "已上传产品图"
+      ? "已上传锁定产品图"
       : "等待上传");
 }
 
@@ -2021,6 +2321,9 @@ function getClipboardImageFiles(event) {
 
 function getDefaultPasteTarget() {
   if (state.mode === "edit") return "edit";
+  if (state.mode === "main" && !state.competitors.length && getOwnImageList().length < MAX_MAIN_OWN_IMAGES) {
+    return "own";
+  }
   if (!state.own) return "own";
   return "competitor";
 }
@@ -2029,7 +2332,7 @@ async function handlePasteFiles(files) {
   const target = state.pasteTarget || getDefaultPasteTarget();
   if (target === "edit") return handleEditFiles(files, true);
   if (target === "competitor") return handleCompetitorFiles(files, true);
-  return handleOwnFiles(files);
+  return handleOwnFiles(files, state.mode === "main");
 }
 
 function setupDrop(zone, input, onFiles, pasteTarget) {
@@ -2056,7 +2359,7 @@ function setupDrop(zone, input, onFiles, pasteTarget) {
   input.addEventListener("change", () => onFiles(input.files));
 }
 
-setupDrop(els.ownDrop, els.ownImage, handleOwnFiles, "own");
+setupDrop(els.ownDrop, els.ownImage, (files) => handleOwnFiles(files, state.mode === "main"), "own");
 
 setupDrop(els.competitorDrop, els.competitorImages, (files) => handleCompetitorFiles(files, true), "competitor");
 
@@ -2151,9 +2454,13 @@ if (els.historyList) {
   });
 }
 if (els.clearHistoryBtn) {
-  els.clearHistoryBtn.addEventListener("click", () => {
-    state.histories[state.historyMode] = [];
-    renderHistory();
+  els.clearHistoryBtn.addEventListener("click", async () => {
+    try {
+      await clearRemoteHistory(state.historyMode);
+      setStatus("历史记录已同步清理");
+    } catch (error) {
+      alert(`清理历史记录失败：${error.message}`);
+    }
   });
 }
 document.querySelectorAll("[data-history-mode]").forEach((button) => {
@@ -2182,7 +2489,7 @@ els.copyPromptBtn.addEventListener("click", async () => {
 (async function initApp() {
   await loadCurrentUser();
   await loadApiConfig();
-  renderHistory();
   setMode("edit");
+  await loadRemoteHistories();
 })();
 

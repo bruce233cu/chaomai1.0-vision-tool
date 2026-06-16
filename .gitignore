@@ -14,6 +14,7 @@ server-run.log
 
 .codex/
 .agents/
+_dev_runtime/
 
 Thumbs.db
 .DS_Store
