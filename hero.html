@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>主图对标优化 · 超迈视觉工具</title>
+  <link rel="stylesheet" href="./hero.css">
+  <script defer src="./hero-core.js"></script>
+  <script defer src="./hero.js"></script>
+</head>
+<body>
+  <main>
+    <header class="top">
+      <a href="./">← 超迈视觉工具</a>
+      <h1>主图对标优化</h1>
+    </header>
+
+    <form id="input" class="panel">
+      <h2>素材与卖点</h2>
+      <div class="grid inputs">
+        <label>自家商品白底图 <small>最多 4 张，支持带透明背景的 PNG</small><input id="products" type="file" accept="image/png,image/jpeg,image/webp" multiple required></label>
+        <label>竞品参考主图 <small>上传一张</small><input id="reference" type="file" accept="image/png,image/jpeg,image/webp" required></label>
+        <label>确认过的卖点 <small>用于选择改进方向，也可作为图上文案</small><input id="claim" maxlength="24" required placeholder="例如 双刀网，大面积修剪"></label>
+      </div>
+      <div id="product-strip" class="strip"></div>
+      <button class="primary" type="submit">分析参考图</button>
+      <p id="status" role="status" aria-live="polite"></p>
+    </form>
+
+    <section id="analysis" class="panel" hidden>
+      <h2>拆图与改法</h2>
+      <div class="grid analysis-grid">
+        <figure>
+          <div id="evidence-preview" class="evidence-preview">
+            <img id="evidence-image" alt="竞品主图">
+            <span id="evidence-box" hidden></span>
+          </div>
+          <label class="inline"><input id="mini-reference" type="checkbox"> 手机列表预览</label>
+        </figure>
+        <div>
+          <h3>值得借鉴</h3>
+          <ul id="strengths"></ul>
+          <h3 id="issue-title"></h3>
+          <dl id="issue"></dl>
+          <p id="missing"></p>
+          <details id="details"><summary>查看完整拆图</summary><dl id="observations"></dl></details>
+        </div>
+      </div>
+      <div class="grid inputs controls">
+        <label>主体素材<select id="asset"></select><small id="asset-reason"></small></label>
+        <label>图上标题<input id="title" maxlength="24" placeholder="留空导出无字图"></label>
+        <label>白底识别阈值<input id="threshold" type="range" min="230" max="255" value="250"><small>白色商品建议上传透明 PNG，先检查抠图边缘</small></label>
+      </div>
+      <div class="actions">
+        <button id="preview-cutout" type="button">检查商品图层</button>
+        <label class="inline"><input id="apply-issue" type="checkbox"> 生成改进版</label>
+        <label class="inline"><input id="ai-background" type="checkbox"> 使用 AI 生成棚拍背景</label>
+        <button id="render" class="primary" type="button">生成主图</button>
+      </div>
+      <p id="output-status" role="status" aria-live="polite"></p>
+      <img id="cutout" alt="商品抠图预览" hidden>
+    </section>
+
+    <section id="results" class="panel" hidden>
+      <div class="result-head">
+        <h2>成品对照</h2>
+        <label class="inline"><input id="mini-output" type="checkbox"> 手机列表预览</label>
+      </div>
+      <div id="comparison" class="grid comparison">
+        <article>
+          <h3>参考版</h3>
+          <a id="base-full" target="_blank" rel="noopener" title="打开大图"><img id="base-image" alt="参考版主图"></a>
+          <div class="actions"><a id="base-download" class="button" download="主图-参考版.png">下载参考版</a></div>
+        </article>
+        <article id="variant-card" hidden>
+          <h3>改进版</h3>
+          <a id="variant-full" target="_blank" rel="noopener" title="打开大图"><img id="variant-image" alt="改进版主图"></a>
+          <p id="variant-note"></p>
+          <div class="actions"><a id="variant-download" class="button" download="主图-改进版.png">下载改进版</a></div>
+        </article>
+      </div>
+      <div class="actions">
+        <label class="inline">保存版本<select id="chosen"><option value="base">参考版</option><option value="variant">改进版</option></select></label>
+        <button id="save" type="button">存入「以图做图」历史</button>
+        <button id="review" type="button">AI 复核两版</button>
+        <button id="record" type="button">下载本次方案记录</button>
+      </div>
+      <dl id="review-result" hidden></dl>
+      <p id="result-status" role="status" aria-live="polite"></p>
+    </section>
+  </main>
+</body>
+</html>

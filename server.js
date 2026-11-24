@@ -5,6 +5,7 @@ const net = require("net");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { createHeroApi } = require("./hero-api");
 
 const root = __dirname;
 const port = Number(process.env.PORT || 4173);
@@ -23,6 +24,8 @@ const apiConfig = {
   imageModel: process.env.OPENAI_IMAGE_MODEL || savedConfig.imageModel || "gpt-image-1.5",
   llmModel: process.env.OPENAI_LLM_MODEL || savedConfig.llmModel || "",
 };
+const heroApi = createHeroApi({ apiConfig, proxyFetch, readApiResult, extractTextResult });
+const heroRenders = new Set();
 const MODULE_KEYS = ["edit", "main", "develop", "clone"];
 const MODULE_LABELS = {
   edit: "提示词做图",
@@ -50,6 +53,10 @@ const publicStaticFiles = new Set([
   "styles.css",
   "app.js",
   "admin.js",
+  "hero.html",
+  "hero-core.js",
+  "hero.js",
+  "hero.css",
 ]);
 
 function readBody(req) {
@@ -2457,6 +2464,33 @@ if (!isValidUsername(username)) {
       return;
     }
 
+    if (req.method === "POST" && ["/api/hero/analyze", "/api/hero/render", "/api/hero/review"].includes(pathname)) {
+      const user = requireAuth(req, res);
+      if (!user) return;
+      const payload = JSON.parse(await readBody(req) || "{}");
+      if (pathname !== "/api/hero/render") {
+        const analyze = pathname === "/api/hero/analyze";
+        const analysis = await (analyze ? heroApi.analyze(payload) : heroApi.review(payload));
+        logUsage(user, "analyze", "main");
+        sendJson(res, 200, analysis);
+        return;
+      }
+      if (heroRenders.has(user.id)) {
+        sendJson(res, 409, { error: "已有一张图正在生成，请等它完成。" });
+        return;
+      }
+      assertCanGenerate(user, "main");
+      heroRenders.add(user.id);
+      try {
+        const result = await heroApi.render(payload);
+        logUsage(user, "generate", "main");
+        sendJson(res, 200, result);
+      } finally {
+        heroRenders.delete(user.id);
+      }
+      return;
+    }
+
     if (req.method === "POST" && req.url === "/api/analyze") {
       const user = requireAuth(req, res);
       if (!user) return;
@@ -2508,7 +2542,7 @@ if (!isValidUsername(username)) {
       return;
     }
 
-    if ((pathname === "/" || pathname === "/index.html") && !getCurrentUser(req)) {
+    if ((pathname === "/" || pathname === "/index.html" || pathname === "/hero.html") && !getCurrentUser(req)) {
       redirect(res, "/login");
       return;
     }
